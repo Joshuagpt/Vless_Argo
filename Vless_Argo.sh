@@ -32,7 +32,7 @@ fetch_with_retry() {
 # ---------------------------------------------------------------
 if command -v devil >/dev/null 2>&1; then
     PLATFORM="serv00"
-elif [ -f /etc/debian_version ] || [ -f /etc/redhat-release ]; then
+elif [ -f /etc/os-release ] || [ -f /etc/alpine-release ]; then
     PLATFORM="vps"
 else
     PLATFORM="other"
@@ -42,7 +42,20 @@ if [ "$PLATFORM" = "other" ]; then
     red "未能识别当前平台(既非 serv00/ct8 也非常见 Linux 发行版),脚本退出"
     exit 1
 fi
-purple "检测到运行平台: ${PLATFORM}"
+
+# VPS 场景下,init 系统不一定是 systemd(如 Alpine 默认用 OpenRC),需要单独探测
+INIT_SYSTEM="none"
+if [ "$PLATFORM" = "vps" ]; then
+    if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
+        INIT_SYSTEM="systemd"
+    elif command -v rc-service >/dev/null 2>&1 && command -v rc-update >/dev/null 2>&1; then
+        INIT_SYSTEM="openrc"
+    else
+        red "未能识别 init 系统(既非 systemd 也非 OpenRC),脚本退出"
+        exit 1
+    fi
+fi
+purple "检测到运行平台: ${PLATFORM}$( [ "$PLATFORM" = "vps" ] && echo " (init: ${INIT_SYSTEM})" )"
 
 # ---------------------------------------------------------------
 # 公共变量 / 环境变量
@@ -260,7 +273,7 @@ download_binaries() {
             yellow "未能获取官方校验和文件,跳过完整性校验(不影响部署,但建议人工确认下载来源可信)"
         fi
 
-        command -v unzip >/dev/null 2>&1 || (apt-get update -y && apt-get install -y unzip) >/dev/null 2>&1 || yum install -y unzip >/dev/null 2>&1
+        command -v unzip >/dev/null 2>&1 || (apt-get update -y && apt-get install -y unzip) >/dev/null 2>&1 || yum install -y unzip >/dev/null 2>&1 || apk add --no-cache unzip >/dev/null 2>&1
         mkdir -p "${BIN_DIR}/xray-core"
         unzip -o "${BIN_DIR}/xray.zip" -d "${BIN_DIR}/xray-core" >/dev/null && rm -f "${BIN_DIR}/xray.zip" "${BIN_DIR}/xray.zip.dgst"
         chmod +x "${BIN_DIR}/xray-core/xray"
@@ -396,7 +409,16 @@ EOF
         sleep 1
     fi
   else
-    cat > /etc/systemd/system/xray-argo.service << EOF
+    if [[ $ARGO_AUTH =~ ^[A-Z0-9a-z=]{120,250}$ ]]; then
+        cf_args="tunnel --edge-ip-version auto --no-autoupdate --protocol http2 run --token ${ARGO_AUTH}"
+    elif [[ $ARGO_AUTH =~ TunnelSecret ]]; then
+        cf_args="tunnel --edge-ip-version auto --config ${BIN_DIR}/tunnel.yml run"
+    else
+        cf_args="tunnel --edge-ip-version auto --no-autoupdate --protocol http2 --logfile ${WORKDIR}/boot.log --loglevel info --url http://localhost:${PORT}"
+    fi
+
+    if [ "$INIT_SYSTEM" = "systemd" ]; then
+        cat > /etc/systemd/system/xray-argo.service << EOF
 [Unit]
 Description=Xray VLESS-WS Service
 After=network.target
@@ -414,15 +436,7 @@ LimitNOFILE=1048576
 WantedBy=multi-user.target
 EOF
 
-    if [[ $ARGO_AUTH =~ ^[A-Z0-9a-z=]{120,250}$ ]]; then
-        cf_args="tunnel --edge-ip-version auto --no-autoupdate --protocol http2 run --token ${ARGO_AUTH}"
-    elif [[ $ARGO_AUTH =~ TunnelSecret ]]; then
-        cf_args="tunnel --edge-ip-version auto --config ${BIN_DIR}/tunnel.yml run"
-    else
-        cf_args="tunnel --edge-ip-version auto --no-autoupdate --protocol http2 --logfile ${WORKDIR}/boot.log --loglevel info --url http://localhost:${PORT}"
-    fi
-
-    cat > /etc/systemd/system/cloudflared-argo.service << EOF
+        cat > /etc/systemd/system/cloudflared-argo.service << EOF
 [Unit]
 Description=Cloudflared Argo Tunnel
 After=network.target xray-argo.service
@@ -439,12 +453,60 @@ RestartSec=3
 WantedBy=multi-user.target
 EOF
 
-    systemctl daemon-reload
-    systemctl enable --now xray-argo >/dev/null 2>&1
-    systemctl enable --now cloudflared-argo >/dev/null 2>&1
-    sleep 2
-    systemctl is-active --quiet xray-argo && green "xray-argo.service 运行中" || red "xray-argo.service 启动失败,请用 journalctl -u xray-argo 查看日志"
-    systemctl is-active --quiet cloudflared-argo && green "cloudflared-argo.service 运行中" || red "cloudflared-argo.service 启动失败,请用 journalctl -u cloudflared-argo 查看日志"
+        systemctl daemon-reload
+        systemctl enable --now xray-argo >/dev/null 2>&1
+        systemctl enable --now cloudflared-argo >/dev/null 2>&1
+        sleep 2
+        systemctl is-active --quiet xray-argo && green "xray-argo.service 运行中" || red "xray-argo.service 启动失败,请用 journalctl -u xray-argo 查看日志"
+        systemctl is-active --quiet cloudflared-argo && green "cloudflared-argo.service 运行中" || red "cloudflared-argo.service 启动失败,请用 journalctl -u cloudflared-argo 查看日志"
+
+    elif [ "$INIT_SYSTEM" = "openrc" ]; then
+        # Alpine 等使用 OpenRC 的发行版,没有 systemd,用 /etc/init.d 脚本 + rc-service 管理
+        cat > /etc/init.d/xray-argo << EOF
+#!/sbin/openrc-run
+name="xray-argo"
+description="Xray VLESS-WS Service"
+command="${XRAY_BIN}"
+command_args="run -c ${BIN_DIR}/config.json"
+command_background=true
+pidfile="/run/\${RC_SVCNAME}.pid"
+output_log="${WORKDIR}/xray.log"
+error_log="${WORKDIR}/xray.err.log"
+respawn_max=0
+
+depend() {
+    need net
+}
+EOF
+        chmod +x /etc/init.d/xray-argo
+
+        cat > /etc/init.d/cloudflared-argo << EOF
+#!/sbin/openrc-run
+name="cloudflared-argo"
+description="Cloudflared Argo Tunnel"
+command="${CLOUDFLARED_BIN}"
+command_args="${cf_args}"
+command_background=true
+pidfile="/run/\${RC_SVCNAME}.pid"
+output_log="${WORKDIR}/cloudflared.log"
+error_log="${WORKDIR}/cloudflared.err.log"
+respawn_max=0
+
+depend() {
+    need net
+    after xray-argo
+}
+EOF
+        chmod +x /etc/init.d/cloudflared-argo
+
+        rc-update add xray-argo default >/dev/null 2>&1
+        rc-update add cloudflared-argo default >/dev/null 2>&1
+        rc-service xray-argo restart >/dev/null 2>&1
+        rc-service cloudflared-argo restart >/dev/null 2>&1
+        sleep 2
+        rc-service xray-argo status 2>/dev/null | grep -q started && green "xray-argo (OpenRC) 运行中" || red "xray-argo (OpenRC) 启动失败,请查看 ${WORKDIR}/xray.err.log"
+        rc-service cloudflared-argo status 2>/dev/null | grep -q started && green "cloudflared-argo (OpenRC) 运行中" || red "cloudflared-argo (OpenRC) 启动失败,请查看 ${WORKDIR}/cloudflared.err.log"
+    fi
   fi
 }
 start_services
