@@ -309,7 +309,7 @@ generate_config() {
           "streamSettings": {
               "network": "ws",
               "wsSettings": {
-                  "path": "/vless-argo"
+                  "path": "/vless-argo?ed=2560"
               }
           }
         }
@@ -516,7 +516,7 @@ generate_links() {
   echo -e "\e[1;32mArgoDomain: \e[1;35m${argodomain}\e[0m\n"
 
   NAME="vless-argo-${PLATFORM}-${USERNAME}"
-  LINK="vless://${UUID}@${CFIP}:${CFPORT}?encryption=none&security=tls&sni=${argodomain}&type=ws&host=${argodomain}&path=%2Fvless-argo%3Fed%3D2048#${NAME}"
+  LINK="vless://${UUID}@${CFIP}:${CFPORT}?encryption=none&security=tls&sni=${argodomain}&type=ws&host=${argodomain}&path=%2Fvless-argo%3Fed%3D2560#${NAME}"
 
   echo "$LINK" > "${FILE_PATH}/${SUB_TOKEN}_vless.log"
   echo "$LINK"
