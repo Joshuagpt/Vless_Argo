@@ -1,8 +1,21 @@
 #!/bin/bash
 # ===================================================================
 # 通用 VLESS+WS+Argo 一键部署脚本
-# 兼容: Serv00/CT8 (共享主机, devil管理) 和 普通 Linux VPS (systemd管理)
+# 兼容: Serv00/CT8 (共享主机, devil管理) 和 普通 Linux VPS (systemd/OpenRC管理)
 # ===================================================================
+
+# Alpine 默认不装 bash(默认 shell 是 busybox ash), 若被 sh 调用则自举切换到 bash
+if [ -z "$BASH_VERSION" ]; then
+    if command -v apk >/dev/null 2>&1; then
+        apk add --no-cache bash >/dev/null 2>&1
+    fi
+    if command -v bash >/dev/null 2>&1; then
+        exec bash "$0" "$@"
+    else
+        echo "本脚本需要 bash, 且自动安装失败, 请手动安装 bash 后重试" >&2
+        exit 1
+    fi
+fi
 
 re="\033[0m"
 red() { echo -e "\e[1;91m$1\033[0m"; }
@@ -11,14 +24,37 @@ yellow() { echo -e "\e[1;33m$1\033[0m"; }
 purple() { echo -e "\e[1;35m$1\033[0m"; }
 export LC_ALL=C
 
+# ---------------------------------------------------------------
+# 子命令解析: 不带参数=安装, re=用新的环境变量重新配置并重启, de=卸载并清理
+# 用法示例:
+#   VLESS_PORT=8443 bash <(curl -Ls .../Vless_Argo.sh)         # 安装
+#   VLESS_PORT=9443 UUID=xxx bash <(curl -Ls .../Vless_Argo.sh) re   # 改参数重装
+#   bash <(curl -Ls .../Vless_Argo.sh) de                            # 卸载清理
+# ---------------------------------------------------------------
+ACTION="${1:-install}"
+case "$ACTION" in
+    install|re|de) ;;
+    *) red "未知参数: ${ACTION} (支持: 留空=安装, re=用新参数重装, de=卸载并清理)"; exit 1 ;;
+esac
+
+# 下载工具探测: 优先 curl, 没有则用 wget(含 busybox wget, 用短参数保证兼容)
+HAVE_CURL=0; command -v curl >/dev/null 2>&1 && HAVE_CURL=1
+HAVE_WGET=0; command -v wget >/dev/null 2>&1 && HAVE_WGET=1
+if [ "$HAVE_CURL" = 0 ] && [ "$HAVE_WGET" = 0 ]; then
+    red "Error: 需要 curl 或 wget, 请先安装其中之一"
+    exit 1
+fi
+
 # 统一的下载函数:自带超时 + 重试,避免网络抖动时脚本直接卡死或静默失败
 # 用法: fetch_with_retry <URL> <输出路径>
 fetch_with_retry() {
     local url="$1" out="$2" attempt=0 max_attempts=3
     while [ $attempt -lt $max_attempts ]; do
         attempt=$((attempt + 1))
-        if curl -fL -sS --connect-timeout 10 --max-time 120 --retry 2 --retry-delay 2 -o "$out" "$url"; then
-            return 0
+        if [ "$HAVE_CURL" = 1 ]; then
+            curl -fL -sS --connect-timeout 10 --max-time 120 --retry 2 --retry-delay 2 -o "$out" "$url" && return 0
+        else
+            wget -q -T 10 -t 1 -O "$out" "$url" && return 0
         fi
         yellow "下载失败(第 ${attempt} 次): ${url}，2秒后重试..."
         sleep 2
@@ -56,6 +92,7 @@ if [ "$PLATFORM" = "vps" ]; then
     fi
 fi
 purple "检测到运行平台: ${PLATFORM}$( [ "$PLATFORM" = "vps" ] && echo " (init: ${INIT_SYSTEM})" )"
+[ "$ACTION" = "re" ] && purple "模式: 重新配置(沿用已下载的二进制,套用新的环境变量并重启服务)"
 
 # ---------------------------------------------------------------
 # 公共变量 / 环境变量
@@ -63,9 +100,6 @@ purple "检测到运行平台: ${PLATFORM}$( [ "$PLATFORM" = "vps" ] && echo " (
 HOSTNAME=$(hostname)
 USERNAME=$(whoami | tr '[:upper:]' '[:lower:]')
 export UUID=${UUID:-$(cat /proc/sys/kernel/random/uuid 2>/dev/null || echo -n "$USERNAME+$HOSTNAME" | md5sum | head -c 32 | sed -E 's/(.{8})(.{4})(.{4})(.{4})(.{12})/\1-\2-\3-\4-\5/')}
-export NEZHA_SERVER=${NEZHA_SERVER:-''}
-export NEZHA_PORT=${NEZHA_PORT:-''}
-export NEZHA_KEY=${NEZHA_KEY:-''}
 export ARGO_DOMAIN=${ARGO_DOMAIN:-''}
 export ARGO_AUTH=${ARGO_AUTH:-''}
 export CFIP=${CFIP:-'saas.sin.fan'}
@@ -74,7 +108,49 @@ export SUB_TOKEN=${SUB_TOKEN:-${UUID:0:8}}
 # 仅 VPS 场景使用,serv00 端口由 devil 分配后覆盖
 export VLESS_PORT=${VLESS_PORT:-'443'}
 
-command -v curl &>/dev/null && COMMAND="curl -so" || command -v wget &>/dev/null && COMMAND="wget -qO" || { red "Error: 需要安装 curl 或 wget"; exit 1; }
+# ---------------------------------------------------------------
+# 卸载/清理(de 模式专用): 停服务、删配置、删站点,不做任何安装动作
+# ---------------------------------------------------------------
+do_uninstall() {
+    purple "正在卸载 vless-argo 并清理相关文件..."
+
+    if [ "$PLATFORM" = "serv00" ]; then
+        for pidfile in "${BIN_DIR}/web.pid" "${BIN_DIR}/bot.pid"; do
+            if [ -f "$pidfile" ]; then
+                old_pid=$(cat "$pidfile" 2>/dev/null)
+                [ -n "$old_pid" ] && kill -9 "$old_pid" >/dev/null 2>&1
+            fi
+        done
+        pkill -f "${BIN_DIR}/web" >/dev/null 2>&1
+        pkill -f "${BIN_DIR}/bot" >/dev/null 2>&1
+
+        devil www del "${USERNAME}.${CURRENT_DOMAIN}" >/dev/null 2>&1
+        devil www del "keep.${USERNAME}.${CURRENT_DOMAIN}" >/dev/null 2>&1
+
+        rm -rf "$WORKDIR" "$FILE_PATH" "$BIN_DIR"
+        rm -rf "$HOME/domains/keep.${USERNAME}.${CURRENT_DOMAIN}"
+
+        green "serv00/ct8 上的节点服务、保活服务及相关文件已清理完毕"
+    else
+        if [ "$INIT_SYSTEM" = "systemd" ]; then
+            systemctl disable --now xray-argo >/dev/null 2>&1
+            systemctl disable --now cloudflared-argo >/dev/null 2>&1
+            rm -f /etc/systemd/system/xray-argo.service /etc/systemd/system/cloudflared-argo.service
+            systemctl daemon-reload >/dev/null 2>&1
+        elif [ "$INIT_SYSTEM" = "openrc" ]; then
+            rc-service xray-argo stop >/dev/null 2>&1
+            rc-service cloudflared-argo stop >/dev/null 2>&1
+            rc-update del xray-argo default >/dev/null 2>&1
+            rc-update del cloudflared-argo default >/dev/null 2>&1
+            rm -f /etc/init.d/xray-argo /etc/init.d/cloudflared-argo
+        fi
+
+        rm -rf "$WORKDIR" "$FILE_PATH" "$BIN_DIR"
+        green "VPS 上的服务、配置文件和二进制已清理完毕"
+    fi
+
+    green "卸载完成"
+}
 
 # ---------------------------------------------------------------
 # 目录规划(两个平台分别处理)
@@ -90,8 +166,14 @@ if [ "$PLATFORM" = "serv00" ]; then
     WORKDIR="${HOME}/domains/${USERNAME}.${CURRENT_DOMAIN}/logs"
     FILE_PATH="${HOME}/domains/${USERNAME}.${CURRENT_DOMAIN}/public_html"
     BIN_DIR="${HOME}/.vless_argo_bin"
+
+    if [ "$ACTION" = "de" ]; then
+        do_uninstall
+        exit 0
+    fi
+
     # 只清理上一次由本脚本启动、且记录在 pid 文件里的进程,不再广撒网 kill 当前用户下所有进程
-    for pidfile in "${BIN_DIR}/web.pid" "${BIN_DIR}/bot.pid" "${BIN_DIR}/nezha.pid"; do
+    for pidfile in "${BIN_DIR}/web.pid" "${BIN_DIR}/bot.pid"; do
         if [ -f "$pidfile" ]; then
             old_pid=$(cat "$pidfile" 2>/dev/null)
             if [ -n "$old_pid" ] && kill -0 "$old_pid" >/dev/null 2>&1; then
@@ -106,6 +188,12 @@ else
     WORKDIR="/var/log/xray-argo"
     FILE_PATH="/var/www/xray-argo"
     BIN_DIR="/etc/xray-argo"
+
+    if [ "$ACTION" = "de" ]; then
+        do_uninstall
+        exit 0
+    fi
+
     mkdir -p "$WORKDIR" "$FILE_PATH" "$BIN_DIR"
 fi
 
@@ -170,13 +258,14 @@ argo_configure() {
     echo $ARGO_AUTH > "${BIN_DIR}/tunnel.json"
 
     # 提取 TunnelID:优先用 python3 做正规 JSON 解析,不依赖字段固定顺序;
-    # 没有 python3 时退化为 grep -oP 按 key 名匹配(同样不依赖顺序),
+    # 没有 python3 时退化为 sed 基础正则匹配(不依赖 PCRE, busybox sed/grep 也兼容,
+    # 不像 grep -P 在 Alpine 等 musl+busybox 系统上大概率不支持),
     # 两者都失败才报错退出,避免生成一个 tunnel id 为空的坏配置。
     if command -v python3 >/dev/null 2>&1; then
         TUNNEL_ID=$(python3 -c "import json,sys; print(json.load(open('${BIN_DIR}/tunnel.json'))['TunnelID'])" 2>/dev/null)
     fi
     if [ -z "$TUNNEL_ID" ]; then
-        TUNNEL_ID=$(grep -oP '"TunnelID"\s*:\s*"\K[^"]+' "${BIN_DIR}/tunnel.json" 2>/dev/null)
+        TUNNEL_ID=$(sed -n 's/.*"TunnelID"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "${BIN_DIR}/tunnel.json" 2>/dev/null)
     fi
     if [ -z "$TUNNEL_ID" ]; then
         red "无法从 ARGO_AUTH 中解析出 TunnelID,请检查该 JSON 凭证是否完整(需包含 TunnelID 字段)"
@@ -232,18 +321,6 @@ download_binaries() {
     fi
     XRAY_BIN="${BIN_DIR}/web"
     CLOUDFLARED_BIN="${BIN_DIR}/bot"
-
-    if [ -n "$NEZHA_PORT" ]; then
-        if [ ! -x "${BIN_DIR}/npm" ] || [ "$FORCE_REDOWNLOAD" = "1" ]; then
-            fetch_with_retry "${BASE_URL}/npm" "${BIN_DIR}/npm" && chmod +x "${BIN_DIR}/npm"
-        fi
-        NEZHA_BIN="${BIN_DIR}/npm"
-    elif [ -n "$NEZHA_SERVER" ]; then
-        if [ ! -x "${BIN_DIR}/php" ] || [ "$FORCE_REDOWNLOAD" = "1" ]; then
-            fetch_with_retry "${BASE_URL}/v1" "${BIN_DIR}/php" && chmod +x "${BIN_DIR}/php"
-        fi
-        NEZHA_BIN="${BIN_DIR}/php"
-    fi
   else
     case "$ARCH" in
         x86_64|amd64) XARCH="64"; CF_ARCH="amd64" ;;
@@ -254,13 +331,15 @@ download_binaries() {
     if [ -x "${BIN_DIR}/xray-core/xray" ] && [ "$FORCE_REDOWNLOAD" != "1" ]; then
         green "xray 已存在,跳过下载(如需强制重下载,设置 FORCE_REDOWNLOAD=1)"
     else
-        XRAY_VER=$(curl -fsS --connect-timeout 10 --max-time 30 https://api.github.com/repos/XTLS/Xray-core/releases/latest | grep -oE '"tag_name":\s*"[^"]+"' | cut -d'"' -f4)
+        fetch_with_retry "https://api.github.com/repos/XTLS/Xray-core/releases/latest" "${BIN_DIR}/xray_latest.json" || exit 1
+        XRAY_VER=$(grep -oE '"tag_name"[[:space:]]*:[[:space:]]*"[^"]+"' "${BIN_DIR}/xray_latest.json" | head -n1 | cut -d'"' -f4)
+        rm -f "${BIN_DIR}/xray_latest.json"
         [ -z "$XRAY_VER" ] && { red "获取 Xray-core 版本号失败(可能是 GitHub API 限流或网络问题),请检查网络后重试"; exit 1; }
 
         fetch_with_retry "https://github.com/XTLS/Xray-core/releases/download/${XRAY_VER}/Xray-linux-${XARCH}.zip" "${BIN_DIR}/xray.zip" || exit 1
 
-        # 校验和验证:下载官方 .dgst 摘要文件,核对 sha256,拿不到摘要文件则跳过校验(不阻断部署,只是降级为无校验下载)
-        if fetch_with_retry "https://github.com/XTLS/Xray-core/releases/download/${XRAY_VER}/Xray-linux-${XARCH}.zip.dgst" "${BIN_DIR}/xray.zip.dgst"; then
+        # 校验和验证:需要本机有 sha256sum 且能拿到官方 .dgst 摘要文件,任一条件不满足则跳过校验(不阻断部署,只是降级为无校验下载)
+        if command -v sha256sum >/dev/null 2>&1 && fetch_with_retry "https://github.com/XTLS/Xray-core/releases/download/${XRAY_VER}/Xray-linux-${XARCH}.zip.dgst" "${BIN_DIR}/xray.zip.dgst"; then
             expected_sha256=$(grep -i '^SHA256' "${BIN_DIR}/xray.zip.dgst" | awk '{print $NF}')
             actual_sha256=$(sha256sum "${BIN_DIR}/xray.zip" | awk '{print $1}')
             if [ -n "$expected_sha256" ] && [ "$expected_sha256" != "$actual_sha256" ]; then
@@ -270,7 +349,7 @@ download_binaries() {
                 green "Xray-core sha256 校验通过"
             fi
         else
-            yellow "未能获取官方校验和文件,跳过完整性校验(不影响部署,但建议人工确认下载来源可信)"
+            yellow "本机无 sha256sum 或未能获取官方校验和文件,跳过完整性校验(不影响部署,但建议人工确认下载来源可信)"
         fi
 
         command -v unzip >/dev/null 2>&1 || (apt-get update -y && apt-get install -y unzip) >/dev/null 2>&1 || yum install -y unzip >/dev/null 2>&1 || apk add --no-cache unzip >/dev/null 2>&1
@@ -287,10 +366,6 @@ download_binaries() {
         chmod +x "${BIN_DIR}/cloudflared"
     fi
     CLOUDFLARED_BIN="${BIN_DIR}/cloudflared"
-
-    # 哪吒监控在 VPS 上建议直接用官方一键安装脚本(systemd自管理),这里不重复实现,
-    # 如需接入可在 NEZHA_SERVER/NEZHA_KEY 存在时自行调用:
-    # curl -L https://raw.githubusercontent.com/nezhahq/scripts/main/install.sh -o nezha.sh && bash nezha.sh
   fi
 }
 download_binaries
@@ -382,32 +457,6 @@ start_services() {
         echo $! > "${BIN_DIR}/bot.pid"
         sleep 2
     fi
-
-    if [ -n "$NEZHA_SERVER" ] && [ -n "$NEZHA_KEY" ] && [ -n "$NEZHA_BIN" ]; then
-        if [ -n "$NEZHA_PORT" ]; then
-            tlsPorts=("443" "8443" "2096" "2087" "2083" "2053")
-            [[ "${tlsPorts[*]}" =~ "${NEZHA_PORT}" ]] && NEZHA_TLS="--tls" || NEZHA_TLS=""
-            export TMPDIR="$BIN_DIR"
-            nohup "$NEZHA_BIN" -s "${NEZHA_SERVER}:${NEZHA_PORT}" -p "${NEZHA_KEY}" ${NEZHA_TLS} >/dev/null 2>&1 &
-            echo $! > "${BIN_DIR}/nezha.pid"
-        else
-            cat > "${WORKDIR}/config.yaml" << EOF
-client_secret: ${NEZHA_KEY}
-debug: false
-disable_auto_update: true
-disable_command_execute: false
-disable_force_update: true
-disable_nat: false
-disable_send_query: false
-server: ${NEZHA_SERVER}
-tls: $(case "${NEZHA_SERVER##*:}" in 443|8443|2096|2087|2083|2053) echo -n tls;; *) echo -n false;; esac)
-uuid: ${UUID}
-EOF
-            nohup "$NEZHA_BIN" -c "${WORKDIR}/config.yaml" >/dev/null 2>&1 &
-            echo $! > "${BIN_DIR}/nezha.pid"
-        fi
-        sleep 1
-    fi
   else
     if [[ $ARGO_AUTH =~ ^[A-Z0-9a-z=]{120,250}$ ]]; then
         cf_args="tunnel --edge-ip-version auto --no-autoupdate --protocol http2 run --token ${ARGO_AUTH}"
@@ -454,8 +503,10 @@ WantedBy=multi-user.target
 EOF
 
         systemctl daemon-reload
-        systemctl enable --now xray-argo >/dev/null 2>&1
-        systemctl enable --now cloudflared-argo >/dev/null 2>&1
+        systemctl enable xray-argo >/dev/null 2>&1
+        systemctl enable cloudflared-argo >/dev/null 2>&1
+        systemctl restart xray-argo >/dev/null 2>&1
+        systemctl restart cloudflared-argo >/dev/null 2>&1
         sleep 2
         systemctl is-active --quiet xray-argo && green "xray-argo.service 运行中" || red "xray-argo.service 启动失败,请用 journalctl -u xray-argo 查看日志"
         systemctl is-active --quiet cloudflared-argo && green "cloudflared-argo.service 运行中" || red "cloudflared-argo.service 启动失败,请用 journalctl -u cloudflared-argo 查看日志"
@@ -539,21 +590,18 @@ install_keepalive() {
     devil www add "keep.${USERNAME}.${CURRENT_DOMAIN}" nodejs /usr/local/bin/node18 > /dev/null 2>&1
     keep_path="$HOME/domains/keep.${USERNAME}.${CURRENT_DOMAIN}/public_nodejs"
     [ -d "$keep_path" ] || mkdir -p "$keep_path"
-    $COMMAND "${keep_path}/app.js" "https://xray.ssss.nyc.mn/vmess.js"
+    fetch_with_retry "https://xray.ssss.nyc.mn/vmess.js" "${keep_path}/app.js"
 
     cat > "${keep_path}/.env" <<EOF
 UUID=${UUID}
 CFIP=${CFIP}
 CFPORT=${CFPORT}
 SUB_TOKEN=${SUB_TOKEN}
-NEZHA_SERVER=${NEZHA_SERVER}
-NEZHA_PORT=${NEZHA_PORT}
-NEZHA_KEY=${NEZHA_KEY}
 ARGO_DOMAIN=${ARGO_DOMAIN}
 ARGO_AUTH=$([[ -z "$ARGO_AUTH" ]] && echo "" || ([[ "$ARGO_AUTH" =~ ^\{.* ]] && echo "'$ARGO_AUTH'" || echo "$ARGO_AUTH"))
 EOF
     devil www add "${USERNAME}.${CURRENT_DOMAIN}" php > /dev/null 2>&1
-    [ -f "${FILE_PATH}/index.html" ] || $COMMAND "${FILE_PATH}/index.html" "https://github.com/eooce/Sing-box/releases/download/00/index.html"
+    [ -f "${FILE_PATH}/index.html" ] || fetch_with_retry "https://github.com/eooce/Sing-box/releases/download/00/index.html" "${FILE_PATH}/index.html"
     ln -fs /usr/local/bin/node18 ~/bin/node > /dev/null 2>&1
     ln -fs /usr/local/bin/npm18 ~/bin/npm > /dev/null 2>&1
     mkdir -p ~/.npm-global
@@ -563,7 +611,13 @@ EOF
     (cd "${keep_path}" && npm install dotenv axios --silent > /dev/null 2>&1)
     rm -f "$HOME/domains/keep.${USERNAME}.${CURRENT_DOMAIN}/public_nodejs/public/index.html" > /dev/null 2>&1
     devil www restart "keep.${USERNAME}.${CURRENT_DOMAIN}" > /dev/null 2>&1
-    if curl -skL "http://keep.${USERNAME}.${CURRENT_DOMAIN}/${USERNAME}" | grep -q "running"; then
+    check_url="http://keep.${USERNAME}.${CURRENT_DOMAIN}/${USERNAME}"
+    if [ "$HAVE_CURL" = 1 ]; then
+        check_result=$(curl -skL "$check_url")
+    else
+        check_result=$(wget -qO- "$check_url")
+    fi
+    if echo "$check_result" | grep -q "running"; then
         green "全自动保活服务安装成功"
     else
         red "保活服务安装可能未成功,请访问 http://keep.${USERNAME}.${CURRENT_DOMAIN}/status 检查"
@@ -595,4 +649,8 @@ generate_links() {
 }
 generate_links
 
-green "\nRunning done! (platform: ${PLATFORM})\n"
+if [ "$ACTION" = "re" ]; then
+    green "\n重新配置完成! 已用新参数重启服务 (platform: ${PLATFORM})\n"
+else
+    green "\nRunning done! (platform: ${PLATFORM})\n"
+fi
