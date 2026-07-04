@@ -1,4 +1,4 @@
-<h2>Fixed Tunnel</h2>
+<h2>Named Tunnel</h2>
 
 
 ```bash
@@ -34,7 +34,7 @@ TG_TOKEN="..." TG_ID="..." VLESS_PORT="..." UUID="..." ARGO_DOMAIN="..." ARGO_AU
 
 >
 
-<h2>Temporary Tunnel</h2>
+<h2>Quick Tunnel</h2>
 
 
 ```bash
