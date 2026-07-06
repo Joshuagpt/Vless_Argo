@@ -34,15 +34,6 @@ bash <(curl -Ls https://raw.githubusercontent.com/Joshuagpt/Vless_Argo_Reality/m
 
 > 
 
-<h2>- TG Bot</h2>
-
-
-```bash
-TG_TOKEN="..." TG_ID="..." VLESS_PORT="..." UUID="..." ARGO_DOMAIN="..." ARGO_AUTH="..." bash <(curl -Ls https://raw.githubusercontent.com/Joshuagpt/Vless_Argo_Reality/main/Vless_Argo_Reality.sh))
-```
-
->
-
 <h2>✅ Reality</h2>
 
 
