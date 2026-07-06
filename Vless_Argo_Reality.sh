@@ -966,14 +966,20 @@ reality_configure() {
             purple "正在生成 Reality 密钥对..."
             local keypair
             keypair=$("${BIN_DIR}/xray" x25519 2>/dev/null)
+            # 兼容两种 xray x25519 输出格式:
+            #   旧版: "Private key: xxx" / "Public key: xxx"
+            #   新版(v25.3.6+): "PrivateKey: xxx" / "Password: xxx"(Password 就是旧版的 Public key,
+            #   官方改名是为了防止有人误以为公钥可以随便分享——它理论上能被用来探测 Reality 服务端)
+            # 用 grep 按关键字取行、sed 去掉行首的 "标签:" 部分,不依赖空格数量,两种格式都能解析
             export REALITY_PRIVATE_KEY
-            REALITY_PRIVATE_KEY=$(echo "$keypair" | awk '/Private key:/ {print $3}')
+            REALITY_PRIVATE_KEY=$(echo "$keypair" | grep -iE '^Private[[:space:]]*Key[[:space:]]*:' | sed -E 's/^[^:]*:[[:space:]]*//' | tr -d '[:space:]')
             export REALITY_PUBLIC_KEY
-            REALITY_PUBLIC_KEY=$(echo "$keypair" | awk '/Public key:/ {print $3}')
+            REALITY_PUBLIC_KEY=$(echo "$keypair" | grep -iE '^(Public[[:space:]]*Key|Password)[[:space:]]*:' | sed -E 's/^[^:]*:[[:space:]]*//' | tr -d '[:space:]')
             export REALITY_SHORT_ID
             REALITY_SHORT_ID=$(openssl rand -hex 8 2>/dev/null || head -c8 /dev/urandom | od -An -tx1 | tr -d ' \n')
             if [ -z "$REALITY_PRIVATE_KEY" ] || [ -z "$REALITY_PUBLIC_KEY" ]; then
-                red "生成 Reality 密钥对失败(xray x25519 命令输出格式可能已变化),Reality 功能已跳过,其余部分正常安装"
+                red "生成 Reality 密钥对失败(xray x25519 命令输出格式可能已变化,新旧两种已知格式都尝试过仍无法解析),Reality 功能已跳过,其余部分正常安装。原始输出如下,可反馈给开发者:"
+                echo "$keypair"
                 unset REALITY_PORT
                 return
             fi
