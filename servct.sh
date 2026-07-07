@@ -961,12 +961,28 @@ EOF
   rm -rf $HOME/.npmrc > /dev/null 2>&1
   cd ${WORKDIR} && npm install dotenv axios koffi --silent > /dev/null 2>&1
   devil www restart ${USERNAME}.${CURRENT_DOMAIN} > /dev/null 2>&1
-  yellow "服务启动中...."
-  sleep 3
-  if curl -o /dev/null -m 3 -s -w "%{http_code}" https://${USERNAME}.${CURRENT_DOMAIN} | grep -q "200"; then
-      green "服务已启动成功,请先访问 https://${USERNAME}.${CURRENT_DOMAIN}  启动服务，过20秒再访问订阅获取节点"
+  # devil www restart 会重新生成 public/ 下的默认占位 index.html，覆盖掉我们之前删的那次；
+  # 这里再清一次，确保根路径请求最终落到 app.js 而不是被这个占位页拦截
+  rm -f "${WORKDIR}/public/index.html" > /dev/null 2>&1
+
+  yellow "服务启动中，首次启动需要下载运行库，请耐心等待...."
+  started=false
+  for i in $(seq 1 15); do
+    sleep 3
+    # devil 每次 restart 都可能重新放回占位页，起服务的这段时间里持续清理，
+    # 避免探测阶段命中占位页而不是真实的 app.js 响应
+    rm -f "${WORKDIR}/public/index.html" > /dev/null 2>&1
+    code=$(curl -o /dev/null -m 3 -s -w "%{http_code}" https://${USERNAME}.${CURRENT_DOMAIN})
+    if [[ "$code" == "200" ]]; then
+      started=true
+      break
+    fi
+  done
+
+  if $started; then
+    green "服务已启动成功,请先访问 https://${USERNAME}.${CURRENT_DOMAIN}  启动服务，过20秒再访问订阅获取节点"
   else
-      red "服务启动失败，请检查端口是否被占用或配置是否正确"
+    yellow "首页探测暂未返回200(可能仍在启动或域名解析较慢)，但这不代表节点一定不可用，请稍后手动访问 https://${USERNAME}.${CURRENT_DOMAIN} 或直接尝试订阅链接确认"
   fi
 
   TOKEN=$(sed -n 's/^SUB_PATH=\(.*\)/\1/p' $HOME/domains/${USERNAME}.${CURRENT_DOMAIN}/public_nodejs/.env)
