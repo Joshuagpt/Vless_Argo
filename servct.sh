@@ -170,11 +170,11 @@ try { require('dotenv').config(); } catch { /* ignore if dotenv unavailable */ }
 // ======================== 环境变量定义 ========================
 const FILE_PATH      = process.env.FILE_PATH      || '.npm';     // sub.txt订阅文件路径
 const SUB_PATH       = process.env.SUB_PATH       || 'sub';      // 订阅sub路径，默认为sub
-const UUID           = process.env.UUID           || '68aa231f-703e-4547-967e-12ed0b36420f'; // UUID
+const UUID           = process.env.UUID           || '54ec9ca5-ba66-447e-a41c-46aa97a73666'; // UUID
 const ARGO_DOMAIN    = process.env.ARGO_DOMAIN    || '';         // argo固定隧道域名,留空即使用临时隧道
 const ARGO_AUTH      = process.env.ARGO_AUTH      || '';         // argo固定隧道token或json,留空即使用临时隧道
 const ARGO_PORT      = Number(process.env.ARGO_PORT) || 8001;    // argo固定隧道端口(本地vless-ws监听端口)
-const CFIP           = process.env.CFIP           || 'saas.sin.fan'; // 优选域名或优选IP
+const CFIP           = process.env.CFIP           || 'ali.ztyawc.de'; // 优选域名或优选IP
 const CFPORT         = Number(process.env.CFPORT) || 443;        // 优选域名或优选IP对应端口
 const PORT           = Number(process.env.PORT)   || 3000;       // http订阅端口
 const NAME           = process.env.NAME           || '';         // 节点名称
@@ -350,10 +350,27 @@ function generateSingBoxConfig() {
   const inbounds = [];
 
   // VLESS+WS inbound (for argo reverse proxy)
+  // 只绑回环地址(127.0.0.1 + ::1)，不再用 '::' 通配所有接口监听。
+  // cloudflared 是通过本机 localhost 反向连过来的，不需要对外网监听；
+  // 而 localhost 在不同环境下可能解析成 IPv4 或 IPv6，所以两个都显式绑定，
+  // 避免只留一个导致解析到另一种地址族时连不上。这样即使这台机器的接口上
+  // 挂了公网 IPv6，这个端口也从设计上就不可能被外部直接连接/探测到。
   inbounds.push({
     type: 'vless',
-    tag: 'vless-ws-in',
-    listen: '::',
+    tag: 'vless-ws-in-v4',
+    listen: '127.0.0.1',
+    listen_port: ARGO_PORT,
+    users: [{ uuid: UUID }],
+    transport: {
+      type: 'ws',
+      path: '/vless-argo',
+      early_data_header_name: 'Sec-WebSocket-Protocol'
+    }
+  });
+  inbounds.push({
+    type: 'vless',
+    tag: 'vless-ws-in-v6',
+    listen: '::1',
     listen_port: ARGO_PORT,
     users: [{ uuid: UUID }],
     transport: {
@@ -997,7 +1014,7 @@ quick_command() {
   mkdir -p "$HOME/bin"
   set +H
   printf '#!/bin/bash\n' > "$SCRIPT_PATH"
-  echo "bash <(curl -Ls https://raw.githubusercontent.com/Joshuagpt/Vless_Argo_Reality/main/servct.sh)" >> "$SCRIPT_PATH"
+  echo "bash <(curl -Ls https://raw.githubusercontent.com/Joshuagpt/Go_Real/main/servct.sh)" >> "$SCRIPT_PATH"
   chmod +x "$SCRIPT_PATH"
   if [[ ":$PATH:" != *":$HOME/bin:"* ]]; then
       echo 'export PATH="$HOME/bin:$PATH"' >> "$HOME/.bashrc" 2>/dev/null
