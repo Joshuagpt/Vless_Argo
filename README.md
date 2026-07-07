@@ -59,15 +59,6 @@ TG_TOKEN="..." TG_ID="..." bash <(curl -Ls https://raw.githubusercontent.com/Jos
 ```
 >
 
-<h2>✅ servct</h2>
-
-
-```bash
-UUID= bash <(curl -Ls https://raw.githubusercontent.com/Joshuagpt/Go_Real/main/servct.sh)
-```
-
->
-
 <h2>✅ servctx</h2>
 
 
