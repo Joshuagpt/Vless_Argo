@@ -70,10 +70,4 @@ UUID= bash <(curl -Ls https://raw.githubusercontent.com/Joshuagpt/Go_Real/main/S
 
 >
 
-<h2>✅ Go_Real_Servct</h2>           
 
-```bash
-VLESS_PORT="..." UUID="..." ARGO_DOMAIN="..." ARGO_AUTH="..." bash <(curl -Ls https://raw.githubusercontent.com/Joshuagpt/Go_Real/main/Go_Real_Servct.sh)
-```
-
->
