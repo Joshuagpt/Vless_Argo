@@ -59,7 +59,7 @@ TG_TOKEN="..." TG_ID="..." bash <(curl -Ls https://raw.githubusercontent.com/Jos
 ```
 >
 
-<h2>✅ servctx</h2>           
+<h2>✅ Servctx</h2>           
 
 
 ```bash
