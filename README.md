@@ -72,7 +72,7 @@ UUID= bash <(curl -Ls https://raw.githubusercontent.com/Joshuagpt/Go_Real/main/S
 
 
 ```bash
-UUID= bash <(curl -Ls https://raw.githubusercontent.com/Joshuagpt/Go_Real/main/Go_Real_Servctx.sh)
+VLESS_PORT="..." UUID="..." ARGO_DOMAIN="..." ARGO_AUTH="..." bash <(curl -Ls https://raw.githubusercontent.com/Joshuagpt/Go_Real/main/Go_Real_Servctx.sh)
 ```
 
 >
