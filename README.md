@@ -54,20 +54,10 @@ TG_TOKEN="..." TG_ID="..." bash <(curl -Ls https://raw.githubusercontent.com/Jos
 
 > 
 
-<h2>✅ Servct</h2>           
-
-```bash
-VLESS_PORT="..." UUID="..." ARGO_DOMAIN="..." ARGO_AUTH="..." bash <(curl -Ls https://raw.githubusercontent.com/Joshuagpt/Go_Real/main/Servct.sh)
-```
-
->
-
 <h2>✅ Servctx</h2>           
 
 ```bash
-UUID= bash <(curl -Ls https://raw.githubusercontent.com/Joshuagpt/Go_Real/main/Servctx.sh)
+UUID="..." bash <(curl -Ls https://raw.githubusercontent.com/Joshuagpt/Go_Real/main/Servctx.sh)
 ```
 
 >
-
-
