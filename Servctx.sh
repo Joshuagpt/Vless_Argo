@@ -266,6 +266,10 @@ const TG_CHAT_ID      = process.env.TG_CHAT_ID      || '';        // Telegram Ch
 // 一方，稍微多留一点余量)，GOGC 则沿用下面这份全局默认，两者内存额度互不共享。
 process.env.GOGC = process.env.GOGC || '40';
 process.env.GOMEMLIMIT = process.env.GOMEMLIMIT || '48MiB';
+// Go 默认用 MADV_FREE 归还内存给系统，OS 不会立刻把这部分从 RSS 里扣掉(要等系统真缺内存时才回收)，
+// 导致 ps/面板看到的数字比"实际在用"的偏高。这里强制换成 MADV_DONTNEED，立即归还，RSS 数字更真实、
+// 更低；代价是稍微多一点系统调用开销，CPU 有富余的情况下这笔交易划算。
+process.env.GODEBUG = [process.env.GODEBUG, 'madvdontneed=1'].filter(Boolean).join(',');
 
 const ROOT = process.cwd();
 const runtimeFilePath = path.resolve(ROOT, FILE_PATH);
