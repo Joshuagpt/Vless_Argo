@@ -649,10 +649,76 @@ PYEOF
     chmod 600 "$WARP_PROFILE" >/dev/null 2>&1
     green "WARP 账号注册成功,凭据已保存到 ${WARP_PROFILE}"
 }
+
+# ---------------------------------------------------------------
+# 功能性验证: UDP出站探测通过、身份也注册成功,不等于 WARP 真的能用。
+# WireGuard 握手用的具体端口(2408等)完全可能被单独限制,而通用UDP
+# (比如标准DNS的53端口)却是放行的,靠"发个包看有没有响应"测不出这种
+# 针对性限制,而且 WireGuard 对非法包本身也不回应,这种探测天然不可靠。
+# 这里直接拿刚注册到的身份,拉起一个只有 wireguard-out 这一个出站的
+# 临时 xray 实例,实际发一次请求看走不走得通,才是唯一可信的判断依据。
+# ---------------------------------------------------------------
+verify_warp_functional() {
+    [ "$WARP" = "1" ] || return 0
+    [ -f "$WARP_PROFILE" ] || return 0
+    if bash -n "$WARP_PROFILE" 2>/dev/null; then
+        # shellcheck disable=SC1090
+        source "$WARP_PROFILE"
+    else
+        return 0   # 损坏文件的情况交给 generate_config 自己处理,这里不重复判断
+    fi
+    [ -n "$WARP_PRIVATE_KEY" ] && [ -n "$WARP_PEER_PUBLIC_KEY" ] || return 0
+
+    purple "正在验证 WARP 出站是否真的可用(实际发一次请求,而不只是探测协议格式/通用UDP)..."
+    local test_port test_conf test_pid ok=0
+    test_port=$(shuf -i 20000-59999 -n 1)
+    test_conf="${BIN_DIR}/.warp_verify.json"
+    cat > "$test_conf" <<EOF
+{
+    "log": { "loglevel": "none" },
+    "inbounds": [
+        { "tag": "verify-in", "listen": "127.0.0.1", "port": ${test_port}, "protocol": "socks", "settings": { "auth": "noauth" } }
+    ],
+    "outbounds": [
+        {
+            "protocol": "wireguard",
+            "tag": "warp-out",
+            "settings": {
+                "secretKey": "${WARP_PRIVATE_KEY}",
+                "address": ["${WARP_ADDRESS_V4:-172.16.0.2/32}", "${WARP_ADDRESS_V6:-::/128}"],
+                "peers": [
+                    { "publicKey": "${WARP_PEER_PUBLIC_KEY}", "endpoint": "${WARP_ENDPOINT:-engage.cloudflareclient.com:2408}" }
+                ],
+                "reserved": [${WARP_RESERVED:-0,0,0}],
+                "mtu": 1280
+            }
+        }
+    ]
+}
+EOF
+    ( cd "$BIN_DIR" && GOMAXPROCS=1 nohup ./core -c "$test_conf" run >/dev/null 2>&1 & echo $! > "${BIN_DIR}/.warp_verify.pid" )
+    sleep 2
+    test_pid=$(cat "${BIN_DIR}/.warp_verify.pid" 2>/dev/null)
+    if [ -n "$test_pid" ] && kill -0 "$test_pid" >/dev/null 2>&1; then
+        if curl -s --socks5-hostname "127.0.0.1:${test_port}" -m 8 "https://www.cloudflare.com/cdn-cgi/trace" >/dev/null 2>&1; then
+            ok=1
+        fi
+    fi
+    [ -n "$test_pid" ] && kill -9 "$test_pid" >/dev/null 2>&1
+    rm -f "$test_conf" "${BIN_DIR}/.warp_verify.pid"
+
+    if [ "$ok" = 1 ]; then
+        green "WARP 出站验证通过(实际流量已成功经过 WARP)"
+    else
+        red "WARP 出站验证失败: 身份注册成功、通用UDP出站也探测通过,但实际流量走不通(大概率是 WireGuard 握手端口被单独限制),已自动关闭 WARP,其余部分正常安装"
+        export WARP=0
+    fi
+}
 if [ "$WARP" = "1" ]; then
     step "配置 WARP 出站"
     check_warp_supported
     warp_register
+    verify_warp_functional
 fi
 
 # ---------------------------------------------------------------
