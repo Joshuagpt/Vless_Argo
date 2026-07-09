@@ -171,9 +171,6 @@ setup_keepalive_cron() {
   local monitor_script="$HOME/bin/px_monitor.sh"
   mkdir -p "$HOME/bin"
 
-  # 独立的探测脚本: 除了原有的"访问自身域名保活"，
-  # 额外做连续失败计数;达到阈值(3次≈30分钟)时通过Telegram告警一次，
-  # 恢复后再发一条恢复通知，避免刷屏。TG_BOT_TOKEN/TG_CHAT_ID留空则静默跳过通知。
   cat > "$monitor_script" <<MONEOF
 #!/bin/bash
 URL="https://${USERNAME}.${CURRENT_DOMAIN}"
@@ -228,6 +225,13 @@ write_app_js() {
   cat > "$1" <<'JSEOF'
 #!/usr/bin/env node
 
+// === 稳定性优化：限制 Node 引擎内存，防止 OOM 被杀 ===
+const v8 = require('v8');
+v8.setFlagsFromString('--max_old_space_size=128');
+
+// === 隐匿性优化：修改主进程标题，伪装成主机自带进程 ===
+process.title = 'passenger_nodejs_app';
+
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
@@ -240,27 +244,29 @@ const { spawn, spawnSync } = require('child_process');
 try { require('dotenv').config(); } catch { /* ignore if dotenv unavailable */ }
 
 // ======================== 环境变量定义 ========================
-const FILE_PATH      = process.env.FILE_PATH      || '.npm';     // sub.txt订阅文件路径
-const SUB_PATH       = process.env.SUB_PATH       || 'sub';      // 订阅sub路径，默认为sub
-const UUID           = process.env.UUID           || '68aa231f-703e-4547-967e-12ed0b36420f'; // UUID
-const RELAY_DOMAIN    = process.env.RELAY_DOMAIN    || '';         // relay固定隧道域名,留空即使用临时隧道
-const RELAY_AUTH      = process.env.RELAY_AUTH      || '';         // relay固定隧道token或json,留空即使用临时隧道
-const RELAY_PORT      = Number(process.env.RELAY_PORT) || 8001;    // relay固定隧道端口(本地监听端口)
-const CFIP           = process.env.CFIP           || 'ali.ztyawc.de'; // 优选域名或优选IP
-const CFPORT         = Number(process.env.CFPORT) || 443;        // 优选域名或优选IP对应端口
-const PORT           = Number(process.env.PORT)   || 3000;       // http订阅端口
-const NAME           = process.env.NAME           || '';         // 节点名称
-const DISABLE_RELAY   = process.env.DISABLE_RELAY   || false;      // 设置为true时禁用relay
-const GLOBAL_WARP    = String(process.env.GLOBAL_WARP).toLowerCase() === 'true'; // true时全部出站走WARP，否则不启用WARP
-const TG_BOT_TOKEN    = process.env.TG_BOT_TOKEN    || '';        // Telegram Bot Token,留空则不发送告警
-const TG_CHAT_ID      = process.env.TG_CHAT_ID      || '';        // Telegram Chat ID,留空则不发送告警
+const FILE_PATH      = process.env.FILE_PATH      || '.npm';     
+const SUB_PATH       = process.env.SUB_PATH       || 'sub';      
+const UUID           = process.env.UUID           || '68aa231f-703e-4547-967e-12ed0b36420f'; 
+const RELAY_DOMAIN    = process.env.RELAY_DOMAIN    || '';         
+const RELAY_AUTH      = process.env.RELAY_AUTH      || '';         
+const RELAY_PORT      = Number(process.env.RELAY_PORT) || 8001;    
+const CFIP           = process.env.CFIP           || 'ali.ztyawc.de'; 
+const CFPORT         = Number(process.env.CFPORT) || 443;        
+const PORT           = Number(process.env.PORT)   || 3000;       
+const NAME           = process.env.NAME           || '';         
+const DISABLE_RELAY   = process.env.DISABLE_RELAY   || false;      
+const GLOBAL_WARP    = String(process.env.GLOBAL_WARP).toLowerCase() === 'true'; 
+const TG_BOT_TOKEN    = process.env.TG_BOT_TOKEN    || '';        
+const TG_CHAT_ID      = process.env.TG_CHAT_ID      || '';        
 // ==============================================================
 
 const ROOT = process.cwd();
 const runtimeFilePath = path.resolve(ROOT, FILE_PATH);
 const libraryDir = runtimeFilePath;
-const engineConfigPath = path.resolve(runtimeFilePath, 'config.json');
-const warpConfigPath = path.resolve(runtimeFilePath, 'warp.json'); // 独立WARP身份持久化文件，注册一次后复用
+
+// === 隐匿性优化：使用不起眼的隐藏文件名存放代理内核配置 ===
+const engineConfigPath = path.resolve(runtimeFilePath, '.passenger_cache.json'); 
+const warpConfigPath = path.resolve(runtimeFilePath, '.warp_session.json'); 
 const bootLogPath = path.resolve(runtimeFilePath, 'boot.log');
 const subPath = path.resolve(runtimeFilePath, 'sub.txt');
 const listPath = path.resolve(runtimeFilePath, 'list.txt');
@@ -274,7 +280,8 @@ const arch = (() => {
 
 // ======================== 文件清理 ========================
 
-const pathsToDelete = ['boot.log', 'list.txt', 'config.json', 'tunnel.json', 'tunnel.yml'];
+// 注意这里清除了旧的显眼配置文件 config.json
+const pathsToDelete = ['boot.log', 'list.txt', 'tunnel.json', 'tunnel.yml', 'config.json'];
 function cleanupOldFiles() {
   pathsToDelete.forEach(file => {
     const filePath = path.join(FILE_PATH, file);
@@ -287,7 +294,7 @@ function cleanupOldFiles() {
 }
 
 function cleanupFiles(options = {}) {
-  const keepFiles = new Set(['warp.json']);
+  const keepFiles = new Set(['.warp_session.json', '.passenger_cache.json']);
   if (options.keepSub) keepFiles.add('sub.txt');
   if (fs.existsSync(runtimeFilePath)) {
     try {
@@ -350,11 +357,6 @@ function relayType() {
 }
 
 // ======================== WARP 身份(注册/复用) ========================
-// 基于 wgcf 同款接口 (api.cloudflareclient.com/v0a884/reg) 独立注册一个 WARP 身份，
-// 而不是使用写死/共享的 WireGuard 密钥。注册结果落盘到 warp.json，之后每次启动优先复用，
-// 避免频繁注册触发 Cloudflare 风控/限流。
-// 注：这部分逻辑跟用 sing-box 还是 engine 无关，是独立于代理内核的通用WARP账号获取流程，
-// 已经过实测验证可以正常注册成功，这里原样保留。
 
 const WARP_REG_URL = 'https://api.cloudflareclient.com/v0a884/reg';
 const WARP_API_HEADERS = {
@@ -363,7 +365,6 @@ const WARP_API_HEADERS = {
   'Content-Type': 'application/json;charset=UTF-8'
 };
 
-// 生成一对 X25519 (Curve25519) 密钥，转成 WireGuard 使用的原始 32 字节 base64 格式。
 function generateWireguardKeyPair() {
   const { publicKey, privateKey } = crypto.generateKeyPairSync('x25519', {
     publicKeyEncoding: { type: 'spki', format: 'der' },
@@ -377,7 +378,6 @@ function generateWireguardKeyPair() {
   };
 }
 
-// 调用 Cloudflare 注册接口，拿到属于自己的 client_id(reserved)、分配的内网地址、以及对端公钥
 async function registerWarp() {
   const { privateKey, publicKey } = generateWireguardKeyPair();
 
@@ -428,15 +428,11 @@ async function registerWarp() {
   };
 }
 
-// 校验本地 warp.json 内容是否完整可用
 function isValidWarpConfig(cfg) {
   return !!(cfg && cfg.private_key && cfg.public_key && cfg.endpoint_host &&
     Array.isArray(cfg.reserved) && cfg.reserved.length === 3 && cfg.address_v4);
 }
 
-// 探测出站 UDP 是否可用：向公共 DNS(1.1.1.1/8.8.8.8) 的 53 端口发一个标准 DNS 查询包，
-// 能收到任意响应即说明本机允许 UDP 出站；serv00/ct8 这类共享托管沙箱通常只放行 TCP，
-// UDP 出站会被直接丢弃，导致 WireGuard(UDP)握手永远无法完成。
 function udpEgressProbe(host, port, timeoutMs) {
   return new Promise((resolve) => {
     let socket;
@@ -470,27 +466,14 @@ function udpEgressProbe(host, port, timeoutMs) {
 }
 
 async function detectUdpEgress() {
-  console.log('WARP: 正在检测本机出站 UDP 连通性（WireGuard 依赖 UDP）...');
-  const targets = [
-    { host: '1.1.1.1', port: 53 },
-    { host: '8.8.8.8', port: 53 }
-  ];
+  const targets = [{ host: '1.1.1.1', port: 53 }, { host: '8.8.8.8', port: 53 }];
   for (const t of targets) {
     const ok = await udpEgressProbe(t.host, t.port, 3000);
-    console.log(`WARP: UDP探测 ${t.host}:${t.port} -> ${ok ? '成功(有响应)' : '失败(超时/无响应)'}`);
-    if (ok) {
-      console.log('WARP: 检测结果 -> 本机支持出站UDP，将继续安装/使用WARP');
-      return true;
-    }
+    if (ok) return true;
   }
-  console.log('WARP: 检测结果 -> 本机不支持出站UDP（大概率是VPS/托管商限制），WireGuard无法工作，将跳过WARP，自动使用纯direct出站');
   return false;
 }
 
-// 用 engine 自带的 `-test` 配置校验模式，实测一份只含 wireguard 出站的最小配置，判断
-// 当前这份 engine 二进制是否认识这套 wireguard outbound 字段结构。
-// 相比之前 sing-box .so 方案：这里是真正独立的子进程调用(spawnSync)，即使这份二进制
-// 完全不认识 wireguard/不支持 -test，最多是这次调用失败返回错误，绝不会连累 Node 主进程。
 function probeEngineWarpSupport(engineBinPath) {
   const probeConfigPath = path.resolve(runtimeFilePath, '.warp-probe.json');
   const probeConfig = {
@@ -510,27 +493,21 @@ function probeEngineWarpSupport(engineBinPath) {
     fs.writeFileSync(probeConfigPath, JSON.stringify(probeConfig));
     result = spawnSync(engineBinPath, ['run', '-test', '-c', probeConfigPath], { encoding: 'utf8', timeout: 10000 });
   } catch (e) {
-    console.log('WARP: engine兼容性探测调用异常(' + e.message + ')，出于稳妥判定为不支持');
-    try { fs.unlinkSync(probeConfigPath); } catch (e2) { /* ignore */ }
+    try { fs.unlinkSync(probeConfigPath); } catch (e2) { }
     return false;
   }
-  try { fs.unlinkSync(probeConfigPath); } catch (e) { /* ignore */ }
+  try { fs.unlinkSync(probeConfigPath); } catch (e) { }
 
   const output = ((result && result.stdout) || '') + ((result && result.stderr) || '');
   if (/unknown (outbound )?protocol|not registered|invalid protocol|unknown config/i.test(output)) {
-    console.log('WARP: 当前 engine 二进制不支持 wireguard 出站，已自动关闭 WARP，其余部分正常安装');
     return false;
   }
   if (/flag provided but not defined|unknown (flag|command)|no such (flag|command)/i.test(output)) {
-    console.log('WARP: 当前 engine 二进制不支持 -test 配置校验模式，无法安全确认WARP是否受支持，出于稳妥已自动关闭 WARP');
     return false;
   }
-  console.log('WARP: engine 兼容性探测通过，支持 wireguard 出站');
   return true;
 }
 
-// 针对性探测：给已注册到的真实 WARP endpoint(host:port) 发一个 UDP 包，仅用于打印更明确的
-// 排障信息，不影响是否启用WARP的决策(WireGuard对非法握手包本身也不会回应，收不到响应不代表被墙)
 function probeWarpEndpoint(host, port, timeoutMs) {
   return new Promise((resolve) => {
     let socket;
@@ -545,7 +522,7 @@ function probeWarpEndpoint(host, port, timeoutMs) {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
-      try { socket.close(); } catch (e) { /* ignore */ }
+      try { socket.close(); } catch (e) { }
       resolve(result);
     };
     const timer = setTimeout(() => finish('no_response'), timeoutMs);
@@ -559,56 +536,33 @@ function probeWarpEndpoint(host, port, timeoutMs) {
 }
 
 async function diagnoseWarpEndpoint(cfg) {
-  console.log(`WARP: 正在针对性探测 WARP 端点 ${cfg.endpoint_host}:${cfg.endpoint_port} ...`);
-  const result = await probeWarpEndpoint(cfg.endpoint_host, cfg.endpoint_port, 3000);
-  if (result === 'responded') {
-    console.log('WARP: 端点探测 -> 收到响应，WARP端点大概率可达');
-  } else if (result === 'rejected') {
-    console.log('WARP: 端点探测 -> 收到明确拒绝(ICMP不可达等)，该主机很可能专门限制了WARP端点，即使继续尝试WARP大概率也无法生效');
-  } else {
-    console.log('WARP: 端点探测 -> 未收到任何响应。这不能100%证明被墙，仍会继续尝试使用WARP；如果实际测试WARP始终未生效，大概率是针对性限制了WARP端点(而非通用UDP出站问题)');
-  }
+  await probeWarpEndpoint(cfg.endpoint_host, cfg.endpoint_port, 3000);
 }
 
-// 综合流程：探测UDP -> 探测engine是否支持wireguard -> 复用/注册WARP身份
 async function getOrCreateWarpIdentity(engineBinPath) {
-  if (!GLOBAL_WARP) {
-    return null;
-  }
+  if (!GLOBAL_WARP) return null;
 
   const udpOk = await detectUdpEgress();
-  if (!udpOk) {
-    return null;
-  }
+  if (!udpOk) return null;
 
   const supported = probeEngineWarpSupport(engineBinPath);
-  if (!supported) {
-    return null;
-  }
+  if (!supported) return null;
 
   let cfg = null;
   try {
     if (fs.existsSync(warpConfigPath)) {
       const loaded = JSON.parse(fs.readFileSync(warpConfigPath, 'utf8'));
       if (isValidWarpConfig(loaded)) {
-        console.log('WARP: 检测到本地 warp.json，复用已注册身份');
         cfg = loaded;
-      } else {
-        console.log('WARP: 本地 warp.json 内容不完整，将重新注册');
       }
     }
-  } catch (e) {
-    console.log('WARP: 读取 warp.json 失败(' + e.message + ')，将重新注册');
-  }
+  } catch (e) {}
 
   if (!cfg) {
     try {
-      console.log('WARP: 未找到可用身份，正在向 Cloudflare 注册新的 WARP 身份...');
       cfg = await registerWarp();
       fs.writeFileSync(warpConfigPath, JSON.stringify(cfg, null, 2));
-      console.log('WARP: 注册成功，已保存到 warp.json，后续将直接复用');
     } catch (e) {
-      console.error('WARP: 注册失败(' + e.message + ')，本次运行将禁用 WARP，自动降级为纯 direct 出站');
       return null;
     }
   }
@@ -638,13 +592,11 @@ function sha256(filePath) {
 async function downloadLibrary(url, fileName, expectedSha256) {
   const target = path.resolve(libraryDir, fileName);
   if (fs.existsSync(target) && await sha256Matches(target, expectedSha256)) {
-    console.log(`Using cached native library: ${target}`);
     return target;
   }
   await fs.promises.mkdir(libraryDir, { recursive: true });
   const tmp = path.resolve(libraryDir, `${fileName}.download`);
   const writer = fs.createWriteStream(tmp);
-  console.log(`Downloading ${url} -> ${target}`);
   const response = await axios.get(url, { responseType: 'stream', timeout: 3 * 60 * 1000 });
   if (response.status < 200 || response.status >= 300) {
     throw new Error(`Failed to download ${url}: HTTP ${response.status}`);
@@ -659,9 +611,7 @@ async function downloadLibrary(url, fileName, expectedSha256) {
 }
 
 // ======================== 告警通知 ========================
-// 仅在 Node 主进程仍存活、但某个子组件反复崩溃/重启耗尽时使用；
-// 若 Node 主进程本身挂了，这里发不出任何东西——那种情况由 bash 侧的
-// px_monitor.sh(crontab 每10分钟探测一次)负责兜底告警。
+
 async function notifyFatal(message) {
   if (!TG_BOT_TOKEN || !TG_CHAT_ID) return;
   try {
@@ -669,15 +619,9 @@ async function notifyFatal(message) {
       chat_id: TG_CHAT_ID,
       text: `[${os.hostname()}] ${message}`
     }, { timeout: 5000 });
-  } catch (e) {
-    console.error('Telegram 通知发送失败:', e.message);
-  }
+  } catch (e) {}
 }
 
-// ======================== 重启节流器(滑动窗口式) ========================
-// 与"从进程启动至今累计崩溃次数"不同: 只要这一次运行存活时间达到 stableMs，
-// 就说明期间是健康的，重启计数清零。这样只有短时间内反复崩溃才会耗尽重启次数，
-// 长期运行、偶尔崩一次的场景不会被历史记录拖累到最终放弃重启。
 function createRestartGuard(maxRestarts = 5, stableMs = 5 * 60 * 1000) {
   let restarts = 0;
   return {
@@ -693,9 +637,6 @@ function createRestartGuard(maxRestarts = 5, stableMs = 5 * 60 * 1000) {
 }
 
 // ======================== 子进程统一管理 ========================
-// engine 和 relay(cloudflared 包装二进制) 现在都是独立子进程，不再有 koffi 进程内 dlopen 那一套。
-// - 崩溃只会导致对应子进程退出，不会带崩 Node 主进程(首页、订阅接口不受影响)
-// - 通过 exit 事件感知崩溃并自动重启，重启计数采用滑动窗口逻辑(长期健康运行会清零计数)
 function spawnManagedProcess(name, binPath, args, options = {}) {
   const { cwd = runtimeFilePath, env = {}, autoRestart = false, maxRestarts = 5, stableMs = 5 * 60 * 1000 } = options;
   const guard = createRestartGuard(maxRestarts, stableMs);
@@ -704,7 +645,10 @@ function spawnManagedProcess(name, binPath, args, options = {}) {
 
   function spawnOnce() {
     const startedAt = Date.now();
-    const child = spawn(binPath, args, {
+    
+    // === 稳定性优化：使用 nice 降低 CPU 调度优先级，防止占用过高被强杀 ===
+    // 我们将原始执行文件和参数传给 nice
+    const child = spawn('nice', ['-n', '10', binPath, ...args], {
       cwd,
       env: { ...process.env, ...env },
       stdio: ['ignore', 'pipe', 'pipe']
@@ -719,15 +663,12 @@ function spawnManagedProcess(name, binPath, args, options = {}) {
     });
 
     child.on('exit', (code, signal) => {
-      if (stopped) return; // 主动调用了 stop()，不算崩溃，不重启
+      if (stopped) return; 
       const aliveMs = Date.now() - startedAt;
-      console.error(`${name} 子进程退出(code=${code}, signal=${signal}, 存活${Math.round(aliveMs / 1000)}秒)`);
       if (!autoRestart) return;
       if (guard.shouldRestart(aliveMs)) {
-        console.error(`${name} 将在2秒后自动重启(第${guard.count}/${guard.max}次)`);
         setTimeout(spawnOnce, 2000);
       } else {
-        console.error(`${name} 短时间内反复崩溃且重启次数已达上限，不再重启`);
         notifyFatal(`${name} 反复崩溃，已停止自动重启(连续在${Math.round(stableMs / 60000)}分钟内失败${guard.max}次)`);
       }
     });
@@ -744,7 +685,7 @@ function spawnManagedProcess(name, binPath, args, options = {}) {
       stopped = true;
       try {
         currentChild && currentChild.kill();
-      } catch (e) { /* ignore */ }
+      } catch (e) { }
       resolve(0);
     })
   };
@@ -755,8 +696,6 @@ function spawnManagedProcess(name, binPath, args, options = {}) {
 function generateEngineConfig(warpConfig) {
   const inbounds = [];
 
-  // 代理协议 inbound (for relay reverse proxy)
-  // 只绑回环地址(127.0.0.1 + ::1)，不对外网监听；cloudflared 通过本机 localhost 反向连过来。
   inbounds.push({
     listen: '127.0.0.1',
     port: RELAY_PORT,
@@ -780,9 +719,6 @@ function generateEngineConfig(warpConfig) {
 
   const outbounds = [];
 
-  // GLOBAL_WARP 且身份可用时，把 wireguard-out 放在 outbounds[0]，
-  // engine 没有显式路由规则匹配时默认走第一个 outbound，等价于"全局走WARP"；
-  // 不满足条件时只保留 direct，行为与不开WARP完全一致。
   if (warpConfig) {
     outbounds.push({
       protocol: 'wireguard',
@@ -816,7 +752,6 @@ function relayLaunchSpec() {
   if (DISABLE_RELAY === 'true' || DISABLE_RELAY === true) return null;
   if (RELAY_AUTH && RELAY_DOMAIN) {
     if (RELAY_AUTH.match(/^[A-Z0-9a-z=]{120,250}$/)) {
-      // token 走环境变量而不是 argv：/proc/pid/cmdline 或 ps aux 都不会明文暴露
       return {
         args: ['tunnel', '--edge-ip-version', 'auto', '--no-autoupdate', '--protocol', 'http2', 'run'],
         env: { TUNNEL_TOKEN: RELAY_AUTH }
@@ -828,7 +763,6 @@ function relayLaunchSpec() {
       };
     }
   }
-  // Quick tunnel
   return {
     args: [
       'tunnel', '--edge-ip-version', 'auto', '--no-autoupdate',
@@ -852,7 +786,7 @@ function waitForQuickTunnelDomain(logPath, timeoutMs) {
           return matches[matches.length - 1][1];
         }
       }
-    } catch (e) { /* file may not exist yet */ }
+    } catch (e) { }
     const remaining = deadline - Date.now();
     if (remaining <= 0) break;
     const sleepMs = Math.min(1000, remaining);
@@ -864,22 +798,13 @@ function waitForQuickTunnelDomain(logPath, timeoutMs) {
 async function extractDomain() {
   if (DISABLE_RELAY === 'true' || DISABLE_RELAY === true) return null;
   if (RELAY_AUTH && RELAY_DOMAIN) {
-    console.log('RELAY_DOMAIN:', RELAY_DOMAIN + '\n');
     return RELAY_DOMAIN;
   }
-  // Quick tunnel
-  console.log('Waiting for quick tunnel domain in log...');
   let domain = waitForQuickTunnelDomain(bootLogPath, 30000);
   if (!domain) {
-    console.log('Quick tunnel domain not found, retrying...');
     try { fs.unlinkSync(bootLogPath); } catch (e) { }
     await new Promise(r => setTimeout(r, 5000));
     domain = waitForQuickTunnelDomain(bootLogPath, 30000);
-  }
-  if (domain) {
-    console.log('RelayDomain:', domain + '\n');
-  } else {
-    console.log('RelayDomain not found');
   }
   return domain;
 }
@@ -898,7 +823,7 @@ async function getMetaInfo() {
       if (response2.data && response2.data.status === 'success' && response2.data.countryCode && response2.data.org) {
         return `${response2.data.countryCode}-${response2.data.org}`.replace(/\s+/g, '_');
       }
-    } catch (error) { /* backup also failed */ }
+    } catch (error) { }
   }
   return 'Unknown';
 }
@@ -913,20 +838,14 @@ async function generateLinks(relayDomain) {
 
   let subTxt = '';
 
-  // 节点链接生成 (relay)
   if ((DISABLE_RELAY !== 'true' && DISABLE_RELAY !== true) && relayDomain) {
     const linkPath = encodeURIComponent('/data-sync?ed=2560');
     subTxt = `vless://${UUID}@${CFIP}:${CFPORT}?encryption=none&security=tls&sni=${relayDomain}&fp=chrome&type=ws&host=${relayDomain}&path=${linkPath}#${encodeURIComponent(nodeName)}`;
   }
 
-  // 打印绿色 base64 编码
-  console.log('\x1b[32m' + Buffer.from(subTxt).toString('base64') + '\x1b[0m');
-  console.log('\n\x1b[35m' + 'Logs will be deleted in 45 seconds, you can copy the above nodes' + '\x1b[0m');
-
   const subTxtWithNewline = subTxt ? subTxt + '\n' : subTxt;
   fs.writeFileSync(subPath, Buffer.from(subTxtWithNewline).toString('base64'));
   fs.writeFileSync(listPath, subTxtWithNewline, 'utf8');
-  console.log(`${FILE_PATH}/sub.txt saved successfully`);
 
   return subTxtWithNewline;
 }
@@ -961,78 +880,42 @@ function startHttpServer(subTxt) {
     }
   });
 
-  server.listen(PORT, '0.0.0.0', () => {
-    console.log(`HTTP server is listening on ${PORT}`);
-  });
-
-  server.on('error', err => {
-    if (err.code === 'EADDRINUSE') {
-      console.error(`Port ${PORT} is already in use.`);
-    } else {
-      console.error('HTTP server error:', err.message);
-    }
-  });
+  server.listen(PORT, '0.0.0.0');
 }
 
 // ======================== 主流程 ========================
 
 async function startServer() {
-  // 1. 创建运行目录 + 清理文件
   if (!fs.existsSync(FILE_PATH)) {
     fs.mkdirSync(FILE_PATH);
-    console.log(`${FILE_PATH} is created`);
   }
   cleanupOldFiles();
 
-  // 2. 生成 Relay 隧道配置
   relayType();
 
-  // 3. 下载核心程序: engine 与 relay(cloudflared 包装二进制) 都是可执行二进制,均以子进程方式启动
+  const releaseBaseUrl = 'https://github.com/Joshuagpt/Go_Real/releases/download/v1';
 
-const releaseBaseUrl = 'https://github.com/Joshuagpt/Go_Real/releases/download/v1';
+  // === 隐匿性优化：下载二进制时直接重命名为常见系统进程，规避监控扫描 ===
+  const engineBinPath = await downloadLibrary(
+      arch === 'arm64' ? `${releaseBaseUrl}/runtime-arm64` : `${releaseBaseUrl}/runtime`,
+      'passenger_worker' // 伪装成 Passenger 进程
+  );
 
-const engineBinPath =
-await downloadLibrary(
-    arch === 'arm64'
-        ? `${releaseBaseUrl}/runtime-arm64`
-        : `${releaseBaseUrl}/runtime`,
-    'runtime'
-);
+  try { fs.chmodSync(engineBinPath, 0o755); } catch (e) {}
 
-try {
-  fs.chmodSync(engineBinPath, 0o755);
-} catch (e) {}
+  let relayBinPath = null;
+  if (DISABLE_RELAY !== 'true' && DISABLE_RELAY !== true) {
+      relayBinPath = await downloadLibrary(
+          arch === 'arm64' ? `${releaseBaseUrl}/relay-arm64` : `${releaseBaseUrl}/relay`,
+          'dbus-daemon' // 伪装成系统总线进程
+      );
+      try { fs.chmodSync(relayBinPath, 0o755); } catch (e) {}
+  }
 
-
-let relayBinPath = null;
-
-if (DISABLE_RELAY !== 'true' && DISABLE_RELAY !== true) {
-
-    // 目前 release 里只发布了单一的 `serv` 二进制(没有 arm64 变体)。
-    // 如果之后补发了 serv-arm64,再按 runtime 那样加 arch 判断即可。
-    if (arch === 'arm64') {
-      console.warn('当前 relay(serv) 二进制暂无 arm64 版本,继续尝试用通用版本下载,如启动异常请检查架构兼容性');
-    }
-    relayBinPath =
-    await downloadLibrary(
-        `${releaseBaseUrl}/serv`,
-        'serv'
-    );
-
-    try {
-      fs.chmodSync(relayBinPath, 0o755);
-    } catch (e) {}
-
-}
-
-  // 4. WARP 身份(仅 GLOBAL_WARP=true 时会走完整流程，否则直接返回 null)
   const warpConfig = await getOrCreateWarpIdentity(engineBinPath);
-
-  // 5. 生成 engine config.json
   const engineConfig = generateEngineConfig(warpConfig);
   fs.writeFileSync(engineConfigPath, JSON.stringify(engineConfig, null, 2));
 
-  // 6. 启动服务(engine + relay 现在是同一套子进程管理逻辑)
   const services = [];
 
   let relayService = null;
@@ -1058,7 +941,19 @@ if (DISABLE_RELAY !== 'true' && DISABLE_RELAY !== true) {
   });
   services.push(engineService);
 
-  // 信号监听:两个子进程统一走 spawnManagedProcess 的 stop()
+// ====== 紧接着加入“阅后即焚”逻辑 ======
+  setTimeout(() => {
+    try {
+      if (fs.existsSync(engineConfigPath)) {
+        fs.unlinkSync(engineConfigPath);
+        console.log('[Security] engine 配置文件已从硬盘擦除 (运行于内存中)');
+      }
+    } catch (e) {
+      // 忽略因权限或已被清理导致的报错
+    }
+  }, 3000);
+  // ======================================
+
   async function stopAll() {
     for (let i = services.length - 1; i >= 0; i--) {
       try { await services[i].stop(); } catch (e) { }
@@ -1069,20 +964,10 @@ if (DISABLE_RELAY !== 'true' && DISABLE_RELAY !== true) {
   process.on('SIGTERM', stopAll);
 
   await new Promise(r => setTimeout(r, 1000));
-  console.log('engine is running');
-
-  if (relayService) {
-     console.log('relay is running');
-  }
-
-  // 7. 等待并检测隧道域名
   await new Promise(r => setTimeout(r, 5000));
   const relayDomain = await extractDomain();
-
-  // 8. 生成节点链接
   const subTxt = await generateLinks(relayDomain);
 
-  // 9. 启动 HTTP 服务器
   startHttpServer(subTxt);
 
   setTimeout(() => {
@@ -1103,9 +988,6 @@ install_service () {
     rm -rf $HOME/domains/${USERNAME}.${CURRENT_DOMAIN} > /dev/null 2>&1
     devil www add ${USERNAME}.${CURRENT_DOMAIN} nodejs /usr/local/bin/node24 > /dev/null 2>&1
     [ -d "$WORKDIR" ] || mkdir -p "$WORKDIR"
-    # devil 在 add 时会自动在 public/ 下放一个默认占位 index.html；
-    # Passenger 对该目录下的静态文件优先级高于应用本身，不清掉的话根路径请求
-    # 永远会被这个占位页拦截，走不到 Node app.js
     rm -f "${WORKDIR}/public/index.html" > /dev/null 2>&1
     write_app_js "${WORKDIR}/app.js"
 
@@ -1300,7 +1182,6 @@ install_service () {
   </div>
 
   <script>
-    // Simulate minor fluctuations in sensor counts for dynamic realism
     setInterval(() => {
       const el = document.getElementById('buoy-count');
       let val = parseInt(el.innerText.replace(',', ''));
@@ -1333,16 +1214,12 @@ EOF
   rm -rf $HOME/.npmrc > /dev/null 2>&1
   cd ${WORKDIR} && npm install dotenv axios --silent > /dev/null 2>&1
   devil www restart ${USERNAME}.${CURRENT_DOMAIN} > /dev/null 2>&1
-  # devil www restart 会重新生成 public/ 下的默认占位 index.html，覆盖掉我们之前删的那次；
-  # 这里再清一次，确保根路径请求最终落到 app.js 而不是被这个占位页拦截
   rm -f "${WORKDIR}/public/index.html" > /dev/null 2>&1
 
   yellow "服务启动中，首次启动需要下载运行库，请耐心等待...."
   started=false
   for i in $(seq 1 15); do
     sleep 3
-    # devil 每次 restart 都可能重新放回占位页，起服务的这段时间里持续清理，
-    # 避免探测阶段命中占位页而不是真实的 app.js 响应
     rm -f "${WORKDIR}/public/index.html" > /dev/null 2>&1
     code=$(curl -o /dev/null -m 3 -s -w "%{http_code}" https://${USERNAME}.${CURRENT_DOMAIN})
     if [[ "$code" == "200" ]]; then
