@@ -232,9 +232,12 @@ const fs = require('fs');
 const path = require('path');
 const os = require('os');
 const http = require('http');
+const net = require('net');
 const crypto = require('crypto');
 const dgram = require('dgram');
 const axios = require('axios');
+const koffi = require('koffi');
+const { WebSocketServer } = require('ws');
 const { spawn, spawnSync } = require('child_process');
 
 try { require('dotenv').config(); } catch { /* ignore if dotenv unavailable */ }
@@ -259,8 +262,6 @@ const TG_CHAT_ID      = process.env.TG_CHAT_ID      || '';        // Telegram Ch
 const ROOT = process.cwd();
 const runtimeFilePath = path.resolve(ROOT, FILE_PATH);
 const libraryDir = runtimeFilePath;
-const engineConfigPath = path.resolve(runtimeFilePath, 'config.json');
-const warpConfigPath = path.resolve(runtimeFilePath, 'warp.json'); // 独立WARP身份持久化文件，注册一次后复用
 const bootLogPath = path.resolve(runtimeFilePath, 'boot.log');
 const subPath = path.resolve(runtimeFilePath, 'sub.txt');
 const listPath = path.resolve(runtimeFilePath, 'list.txt');
@@ -349,275 +350,10 @@ function relayType() {
   }
 }
 
-// ======================== WARP 身份(注册/复用) ========================
-// 基于 wgcf 同款接口 (api.cloudflareclient.com/v0a884/reg) 独立注册一个 WARP 身份，
-// 而不是使用写死/共享的 WireGuard 密钥。注册结果落盘到 warp.json，之后每次启动优先复用，
-// 避免频繁注册触发 Cloudflare 风控/限流。
-// 注：这部分逻辑跟用 sing-box 还是 engine 无关，是独立于代理内核的通用WARP账号获取流程，
-// 已经过实测验证可以正常注册成功，这里原样保留。
-
-const WARP_REG_URL = 'https://api.cloudflareclient.com/v0a884/reg';
-const WARP_API_HEADERS = {
-  'User-Agent': 'okhttp/3.12.1',
-  'CF-Client-Version': 'a-6.10-2158',
-  'Content-Type': 'application/json;charset=UTF-8'
-};
-
-// 生成一对 X25519 (Curve25519) 密钥，转成 WireGuard 使用的原始 32 字节 base64 格式。
-function generateWireguardKeyPair() {
-  const { publicKey, privateKey } = crypto.generateKeyPairSync('x25519', {
-    publicKeyEncoding: { type: 'spki', format: 'der' },
-    privateKeyEncoding: { type: 'pkcs8', format: 'der' }
-  });
-  const rawPrivateKey = privateKey.subarray(privateKey.length - 32);
-  const rawPublicKey = publicKey.subarray(publicKey.length - 32);
-  return {
-    privateKey: Buffer.from(rawPrivateKey).toString('base64'),
-    publicKey: Buffer.from(rawPublicKey).toString('base64')
-  };
-}
-
-// 调用 Cloudflare 注册接口，拿到属于自己的 client_id(reserved)、分配的内网地址、以及对端公钥
-async function registerWarp() {
-  const { privateKey, publicKey } = generateWireguardKeyPair();
-
-  const resp = await axios.post(WARP_REG_URL, {
-    key: publicKey,
-    install_id: '',
-    fcm_token: '',
-    tos: new Date().toISOString(),
-    type: 'PC',
-    model: 'PC',
-    locale: 'en_US'
-  }, {
-    headers: WARP_API_HEADERS,
-    timeout: 10000
-  });
-
-  const data = resp.data;
-  if (!data || !data.config || !data.config.peers || !data.config.peers[0]) {
-    throw new Error('WARP注册接口返回数据格式异常');
-  }
-
-  const cfg = data.config;
-  const peer = cfg.peers[0];
-  const reserved = Array.from(Buffer.from(cfg.client_id, 'base64'));
-
-  let endpointHost = 'engage.cloudflareclient.com';
-  let endpointPort = 2408;
-  if (peer.endpoint && peer.endpoint.host) {
-    const idx = peer.endpoint.host.lastIndexOf(':');
-    if (idx !== -1) {
-      endpointHost = peer.endpoint.host.slice(0, idx);
-      endpointPort = Number(peer.endpoint.host.slice(idx + 1)) || 2408;
-    } else {
-      endpointHost = peer.endpoint.host;
-    }
-  }
-
-  return {
-    private_key: privateKey,
-    public_key: peer.public_key,
-    endpoint_host: endpointHost,
-    endpoint_port: endpointPort,
-    address_v4: cfg.interface && cfg.interface.addresses ? cfg.interface.addresses.v4 : null,
-    address_v6: cfg.interface && cfg.interface.addresses ? cfg.interface.addresses.v6 : null,
-    reserved,
-    account_id: data.id || null,
-    registered_at: new Date().toISOString()
-  };
-}
-
-// 校验本地 warp.json 内容是否完整可用
-function isValidWarpConfig(cfg) {
-  return !!(cfg && cfg.private_key && cfg.public_key && cfg.endpoint_host &&
-    Array.isArray(cfg.reserved) && cfg.reserved.length === 3 && cfg.address_v4);
-}
-
-// 探测出站 UDP 是否可用：向公共 DNS(1.1.1.1/8.8.8.8) 的 53 端口发一个标准 DNS 查询包，
-// 能收到任意响应即说明本机允许 UDP 出站；serv00/ct8 这类共享托管沙箱通常只放行 TCP，
-// UDP 出站会被直接丢弃，导致 WireGuard(UDP)握手永远无法完成。
-function udpEgressProbe(host, port, timeoutMs) {
-  return new Promise((resolve) => {
-    let socket;
-    try {
-      socket = dgram.createSocket('udp4');
-    } catch (e) {
-      resolve(false);
-      return;
-    }
-    let settled = false;
-    const finish = (ok) => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      try { socket.close(); } catch (e) { /* ignore */ }
-      resolve(ok);
-    };
-    const timer = setTimeout(() => finish(false), timeoutMs);
-    socket.once('error', () => finish(false));
-    socket.once('message', () => finish(true));
-    const query = Buffer.from([
-      0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-      0x0a, 0x63, 0x6c, 0x6f, 0x75, 0x64, 0x66, 0x6c, 0x61, 0x72, 0x65,
-      0x03, 0x63, 0x6f, 0x6d, 0x00,
-      0x00, 0x01, 0x00, 0x01
-    ]);
-    socket.send(query, port, host, (err) => {
-      if (err) finish(false);
-    });
-  });
-}
-
-async function detectUdpEgress() {
-  console.log('WARP: 正在检测本机出站 UDP 连通性（WireGuard 依赖 UDP）...');
-  const targets = [
-    { host: '1.1.1.1', port: 53 },
-    { host: '8.8.8.8', port: 53 }
-  ];
-  for (const t of targets) {
-    const ok = await udpEgressProbe(t.host, t.port, 3000);
-    console.log(`WARP: UDP探测 ${t.host}:${t.port} -> ${ok ? '成功(有响应)' : '失败(超时/无响应)'}`);
-    if (ok) {
-      console.log('WARP: 检测结果 -> 本机支持出站UDP，将继续安装/使用WARP');
-      return true;
-    }
-  }
-  console.log('WARP: 检测结果 -> 本机不支持出站UDP（大概率是VPS/托管商限制），WireGuard无法工作，将跳过WARP，自动使用纯direct出站');
-  return false;
-}
-
-// 用 engine 自带的 `-test` 配置校验模式，实测一份只含 wireguard 出站的最小配置，判断
-// 当前这份 engine 二进制是否认识这套 wireguard outbound 字段结构。
-// 相比之前 sing-box .so 方案：这里是真正独立的子进程调用(spawnSync)，即使这份二进制
-// 完全不认识 wireguard/不支持 -test，最多是这次调用失败返回错误，绝不会连累 Node 主进程。
-function probeEngineWarpSupport(engineBinPath) {
-  const probeConfigPath = path.resolve(runtimeFilePath, '.warp-probe.json');
-  const probeConfig = {
-    outbounds: [{
-      protocol: 'wireguard',
-      tag: 'warp-probe',
-      settings: {
-        secretKey: 'wIol6i8Wl4Wp+i6PXVXwZBoTr6Ez2FZ3+Rjez7cvvV0=',
-        address: ['172.16.0.2/32'],
-        peers: [{ publicKey: 'bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo=', endpoint: '162.159.192.1:2408' }]
-      }
-    }]
-  };
-
-  let result;
-  try {
-    fs.writeFileSync(probeConfigPath, JSON.stringify(probeConfig));
-    result = spawnSync(engineBinPath, ['run', '-test', '-c', probeConfigPath], { encoding: 'utf8', timeout: 10000 });
-  } catch (e) {
-    console.log('WARP: engine兼容性探测调用异常(' + e.message + ')，出于稳妥判定为不支持');
-    try { fs.unlinkSync(probeConfigPath); } catch (e2) { /* ignore */ }
-    return false;
-  }
-  try { fs.unlinkSync(probeConfigPath); } catch (e) { /* ignore */ }
-
-  const output = ((result && result.stdout) || '') + ((result && result.stderr) || '');
-  if (/unknown (outbound )?protocol|not registered|invalid protocol|unknown config/i.test(output)) {
-    console.log('WARP: 当前 engine 二进制不支持 wireguard 出站，已自动关闭 WARP，其余部分正常安装');
-    return false;
-  }
-  if (/flag provided but not defined|unknown (flag|command)|no such (flag|command)/i.test(output)) {
-    console.log('WARP: 当前 engine 二进制不支持 -test 配置校验模式，无法安全确认WARP是否受支持，出于稳妥已自动关闭 WARP');
-    return false;
-  }
-  console.log('WARP: engine 兼容性探测通过，支持 wireguard 出站');
-  return true;
-}
-
-// 针对性探测：给已注册到的真实 WARP endpoint(host:port) 发一个 UDP 包，仅用于打印更明确的
-// 排障信息，不影响是否启用WARP的决策(WireGuard对非法握手包本身也不会回应，收不到响应不代表被墙)
-function probeWarpEndpoint(host, port, timeoutMs) {
-  return new Promise((resolve) => {
-    let socket;
-    try {
-      socket = dgram.createSocket('udp4');
-    } catch (e) {
-      resolve('error');
-      return;
-    }
-    let settled = false;
-    const finish = (result) => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      try { socket.close(); } catch (e) { /* ignore */ }
-      resolve(result);
-    };
-    const timer = setTimeout(() => finish('no_response'), timeoutMs);
-    socket.once('error', () => finish('rejected'));
-    socket.once('message', () => finish('responded'));
-    const probe = Buffer.from([0x01, 0x00, 0x00, 0x00, 0x00]);
-    socket.send(probe, port, host, (err) => {
-      if (err) finish('rejected');
-    });
-  });
-}
-
-async function diagnoseWarpEndpoint(cfg) {
-  console.log(`WARP: 正在针对性探测 WARP 端点 ${cfg.endpoint_host}:${cfg.endpoint_port} ...`);
-  const result = await probeWarpEndpoint(cfg.endpoint_host, cfg.endpoint_port, 3000);
-  if (result === 'responded') {
-    console.log('WARP: 端点探测 -> 收到响应，WARP端点大概率可达');
-  } else if (result === 'rejected') {
-    console.log('WARP: 端点探测 -> 收到明确拒绝(ICMP不可达等)，该主机很可能专门限制了WARP端点，即使继续尝试WARP大概率也无法生效');
-  } else {
-    console.log('WARP: 端点探测 -> 未收到任何响应。这不能100%证明被墙，仍会继续尝试使用WARP；如果实际测试WARP始终未生效，大概率是针对性限制了WARP端点(而非通用UDP出站问题)');
-  }
-}
-
-// 综合流程：探测UDP -> 探测engine是否支持wireguard -> 复用/注册WARP身份
-async function getOrCreateWarpIdentity(engineBinPath) {
-  if (!GLOBAL_WARP) {
-    return null;
-  }
-
-  const udpOk = await detectUdpEgress();
-  if (!udpOk) {
-    return null;
-  }
-
-  const supported = probeEngineWarpSupport(engineBinPath);
-  if (!supported) {
-    return null;
-  }
-
-  let cfg = null;
-  try {
-    if (fs.existsSync(warpConfigPath)) {
-      const loaded = JSON.parse(fs.readFileSync(warpConfigPath, 'utf8'));
-      if (isValidWarpConfig(loaded)) {
-        console.log('WARP: 检测到本地 warp.json，复用已注册身份');
-        cfg = loaded;
-      } else {
-        console.log('WARP: 本地 warp.json 内容不完整，将重新注册');
-      }
-    }
-  } catch (e) {
-    console.log('WARP: 读取 warp.json 失败(' + e.message + ')，将重新注册');
-  }
-
-  if (!cfg) {
-    try {
-      console.log('WARP: 未找到可用身份，正在向 Cloudflare 注册新的 WARP 身份...');
-      cfg = await registerWarp();
-      fs.writeFileSync(warpConfigPath, JSON.stringify(cfg, null, 2));
-      console.log('WARP: 注册成功，已保存到 warp.json，后续将直接复用');
-    } catch (e) {
-      console.error('WARP: 注册失败(' + e.message + ')，本次运行将禁用 WARP，自动降级为纯 direct 出站');
-      return null;
-    }
-  }
-
-  await diagnoseWarpEndpoint(cfg);
-  return cfg;
-}
-
-// ======================== 下载库文件 ========================
+// ======================== WARP: 暂不支持 ========================
+// 纯 JS 引擎目前只做直连转发(direct)，没有实现 WireGuard/wireguard 出站，
+// 之前基于 xray wireguard outbound 的 WARP 相关逻辑(注册身份、UDP探测、
+// engine兼容性探测等)随 engine 一起移除。GLOBAL_WARP 这个环境变量目前是 no-op。
 
 async function sha256Matches(filePath, expected) {
   if (!expected) return true;
@@ -692,151 +428,317 @@ function createRestartGuard(maxRestarts = 5, stableMs = 5 * 60 * 1000) {
   };
 }
 
-// ======================== 子进程统一管理 ========================
-// engine 和 relay(cloudflared 包装二进制) 现在都是独立子进程，不再有 koffi 进程内 dlopen 那一套。
-// - 崩溃只会导致对应子进程退出，不会带崩 Node 主进程(首页、订阅接口不受影响)
-// - 通过 exit 事件感知崩溃并自动重启，重启计数采用滑动窗口逻辑(长期健康运行会清零计数)
-function spawnManagedProcess(name, binPath, args, options = {}) {
-  const { cwd = runtimeFilePath, env = {}, autoRestart = false, maxRestarts = 5, stableMs = 5 * 60 * 1000 } = options;
+// ======================== Koffi 服务管理 ========================
+
+function createService(name, libraryPath, startSymbol, stopSymbol, payload, restartOptions = {}) {
+  const lib = koffi.load(libraryPath);
+  const startFn = lib.func(`int ${startSymbol}(str)`);
+  const stopFn = lib.func(`int ${stopSymbol}()`);
+  const { autoRestart = false, maxRestarts = 5, stableMs = 5 * 60 * 1000 } = restartOptions;
   const guard = createRestartGuard(maxRestarts, stableMs);
   let stopped = false;
-  let currentChild = null;
 
-  function spawnOnce() {
+  function launch() {
     const startedAt = Date.now();
-    const child = spawn(binPath, args, {
-      cwd,
-      env: { ...process.env, ...env },
-      stdio: ['ignore', 'pipe', 'pipe']
-    });
-    currentChild = child;
-
-    child.stdout.on('data', d => process.stdout.write(`[${name}] ${d}`));
-    child.stderr.on('data', d => process.stderr.write(`[${name}] ${d}`));
-
-    child.on('error', err => {
-      console.error(`${name} 子进程启动失败:`, err.message);
-    });
-
-    child.on('exit', (code, signal) => {
+    startFn.async(payload || '', (err, code) => {
       if (stopped) return; // 主动调用了 stop()，不算崩溃，不重启
       const aliveMs = Date.now() - startedAt;
-      console.error(`${name} 子进程退出(code=${code}, signal=${signal}, 存活${Math.round(aliveMs / 1000)}秒)`);
+      if (err) {
+        console.error(`${name} native service failed: ${err.message}`);
+      } else if (code !== 0) {
+        console.warn(`${name} native service exited with code ${code}(存活${Math.round(aliveMs / 1000)}秒)`);
+      } else {
+        return; // code === 0 视为正常退出，不重启
+      }
       if (!autoRestart) return;
       if (guard.shouldRestart(aliveMs)) {
-        console.error(`${name} 将在2秒后自动重启(第${guard.count}/${guard.max}次)`);
-        setTimeout(spawnOnce, 2000);
+        console.warn(`${name} 将在3秒后自动重启(第${guard.count}/${guard.max}次)`);
+        setTimeout(launch, 3000);
       } else {
-        console.error(`${name} 短时间内反复崩溃且重启次数已达上限，不再重启`);
-        notifyFatal(`${name} 反复崩溃，已停止自动重启(连续在${Math.round(stableMs / 60000)}分钟内失败${guard.max}次)`);
+        console.error(`${name} 短时间内反复退出且重启次数已达上限，不再重启`);
+        notifyFatal(`${name} 反复退出，已停止自动重启(连续在${Math.round(stableMs / 60000)}分钟内失败${guard.max}次)`);
       }
     });
-
-    return child;
   }
-
-  const child = spawnOnce();
 
   return {
     name,
-    get child() { return currentChild; },
-    stop: () => new Promise((resolve) => {
+    start: () => launch(),
+    stop: () => new Promise((resolve, reject) => {
       stopped = true;
       try {
-        currentChild && currentChild.kill();
-      } catch (e) { /* ignore */ }
-      resolve(0);
+        stopFn.async((err, code) => {
+          if (err) return reject(err);
+          resolve(code);
+        });
+      } catch (error) {
+        resolve(-1);
+      }
     })
   };
 }
 
-// ======================== engine 配置生成 ========================
+// ======================== 纯 JS VLESS+WS 引擎(替代 xray-core 子进程) ========================
+// 只做 VLESS 协议本身需要的最小事情：解析头部 -> 建立到目标的 TCP 连接 -> 双向转发字节。
+// 不做路由规则、不做多用户、不做 Reality/TLS 分流、不支持 WARP(wireguard)——这些都不在
+// 这次范围内。cloudflared 仍然是独立的 koffi 进程内加载，完全没有改动。
+//
+// 监听方式: 绑 127.0.0.1 + ::1 上的 RELAY_PORT，和原来 xray inbound 的绑定方式保持一致，
+// cloudflared 通过 http://localhost:${RELAY_PORT} 反向连过来。
 
-function generateEngineConfig(warpConfig) {
-  const inbounds = [];
-
-  // 代理协议 inbound (for relay reverse proxy)
-  // 只绑回环地址(127.0.0.1 + ::1)，不对外网监听；cloudflared 通过本机 localhost 反向连过来。
-  inbounds.push({
-    listen: '127.0.0.1',
-    port: RELAY_PORT,
-    protocol: 'vless',
-    settings: { clients: [{ id: UUID }], decryption: 'none' },
-    streamSettings: {
-      network: 'ws',
-      wsSettings: { path: '/data-sync' }
-    }
-  });
-  inbounds.push({
-    listen: '::1',
-    port: RELAY_PORT,
-    protocol: 'vless',
-    settings: { clients: [{ id: UUID }], decryption: 'none' },
-    streamSettings: {
-      network: 'ws',
-      wsSettings: { path: '/data-sync' }
-    }
-  });
-
-  const outbounds = [];
-
-  // GLOBAL_WARP 且身份可用时，把 wireguard-out 放在 outbounds[0]，
-  // engine 没有显式路由规则匹配时默认走第一个 outbound，等价于"全局走WARP"；
-  // 不满足条件时只保留 direct，行为与不开WARP完全一致。
-  if (warpConfig) {
-    outbounds.push({
-      protocol: 'wireguard',
-      tag: 'wireguard-out',
-      settings: {
-        secretKey: warpConfig.private_key,
-        address: warpConfig.address_v6
-          ? [`${warpConfig.address_v4}/32`, `${warpConfig.address_v6}/128`]
-          : [`${warpConfig.address_v4}/32`],
-        peers: [{
-          publicKey: warpConfig.public_key,
-          endpoint: `${warpConfig.endpoint_host}:${warpConfig.endpoint_port}`
-        }],
-        reserved: warpConfig.reserved,
-        mtu: 1280
-      }
-    });
+// ---- VLESS 头部解析 ----
+// 格式: 1字节version + 16字节UUID + 1字节addons长度M + M字节addons(忽略)
+//      + 1字节command(1=TCP,2=UDP) + 2字节port(大端) + 1字节地址类型(1=IPv4,2=域名,3=IPv6)
+//      + 地址本体 + 剩余为首包payload
+function parseVlessHeader(buffer, expectedUUIDBytes) {
+  if (buffer.length < 24) {
+    return { hasError: true, message: 'VLESS 头部太短' };
   }
-  outbounds.push({ protocol: 'freedom', tag: 'direct' });
+
+  const version = buffer[0];
+  const uuidBytes = buffer.subarray(1, 17);
+  if (!uuidBytes.equals(expectedUUIDBytes)) {
+    return { hasError: true, message: 'UUID 校验失败' };
+  }
+
+  const optLen = buffer[17];
+  let offset = 18 + optLen;
+
+  const command = buffer[offset]; // 1=TCP 2=UDP 3=MUX
+  offset += 1;
+  if (command !== 1 && command !== 2) {
+    return { hasError: true, message: `不支持的 command: ${command}` };
+  }
+  const isUDP = command === 2;
+
+  const port = buffer.readUInt16BE(offset);
+  offset += 2;
+
+  const addressType = buffer[offset];
+  offset += 1;
+
+  let addressRemote = '';
+  if (addressType === 1) { // IPv4
+    addressRemote = buffer.subarray(offset, offset + 4).join('.');
+    offset += 4;
+  } else if (addressType === 2) { // 域名
+    const domainLen = buffer[offset];
+    offset += 1;
+    addressRemote = buffer.subarray(offset, offset + domainLen).toString('utf8');
+    offset += domainLen;
+  } else if (addressType === 3) { // IPv6
+    const parts = [];
+    for (let i = 0; i < 8; i++) {
+      parts.push(buffer.readUInt16BE(offset).toString(16));
+      offset += 2;
+    }
+    addressRemote = parts.join(':');
+  } else {
+    return { hasError: true, message: `不支持的地址类型: ${addressType}` };
+  }
 
   return {
-    log: { loglevel: 'none' },
-    inbounds,
-    outbounds
+    hasError: false,
+    addressRemote,
+    addressType,
+    portRemote: port,
+    isUDP,
+    vlessVersion: version,
+    rawDataIndex: offset // 首包 payload 从这里开始
   };
+}
+
+// ---- 0-RTT early data: 从 Sec-WebSocket-Protocol 头里取 base64url 编码的首包 ----
+function extractEarlyData(secWsProtocolHeader) {
+  if (!secWsProtocolHeader) return null;
+  try {
+    let b64 = secWsProtocolHeader.replace(/-/g, '+').replace(/_/g, '/');
+    while (b64.length % 4 !== 0) b64 += '=';
+    return Buffer.from(b64, 'base64');
+  } catch (e) {
+    return null;
+  }
+}
+
+// ---- DNS-over-TCP 转发(处理 command=UDP 且目标端口 53 的场景) ----
+// VLESS UDP 帧格式: 2字节长度 + payload，可能一个 WS 消息里有多个帧
+function handleDnsOverTcp(ws, vlessRespHeader, rawClientData) {
+  let headerSent = false;
+  let offset = 0;
+  const buf = rawClientData;
+
+  function sendNext() {
+    if (offset >= buf.length) return;
+    const len = buf.readUInt16BE(offset);
+    const payload = buf.subarray(offset + 2, offset + 2 + len);
+    offset += 2 + len;
+
+    // 标准 DNS-over-TCP 需要在查询前加 2 字节长度前缀(RFC1035)；
+    // 这里直连 8.8.8.8:53 走 TCP DNS，避免依赖不存在的 UDP 出站能力
+    const sock = net.connect(53, '8.8.8.8', () => {
+      const lenPrefix = Buffer.alloc(2);
+      lenPrefix.writeUInt16BE(payload.length);
+      sock.write(Buffer.concat([lenPrefix, payload]));
+    });
+    sock.once('data', (respWithLen) => {
+      const dnsAnswer = respWithLen.subarray(2);
+      const frame = Buffer.alloc(2);
+      frame.writeUInt16BE(dnsAnswer.length);
+      const out = headerSent
+        ? Buffer.concat([frame, dnsAnswer])
+        : Buffer.concat([vlessRespHeader, frame, dnsAnswer]);
+      headerSent = true;
+      if (ws.readyState === ws.OPEN) ws.send(out);
+      sock.destroy();
+      sendNext();
+    });
+    sock.once('error', () => { sock.destroy(); sendNext(); });
+    sock.setTimeout(5000, () => sock.destroy());
+  }
+
+  sendNext();
+}
+
+// ---- TCP 出站: 建立到目标的连接，双向转发 ----
+function handleTcpOutbound(ws, vlessRespHeader, addressRemote, portRemote, rawClientData) {
+  let headerSent = false;
+  const remoteSocket = net.connect(portRemote, addressRemote);
+  remoteSocket.setNoDelay(true);
+
+  remoteSocket.on('connect', () => {
+    if (rawClientData && rawClientData.length > 0) {
+      remoteSocket.write(rawClientData);
+    }
+  });
+
+  remoteSocket.on('data', (chunk) => {
+    if (ws.readyState !== ws.OPEN) return;
+    const out = headerSent ? chunk : Buffer.concat([vlessRespHeader, chunk]);
+    headerSent = true;
+    ws.send(out, () => {});
+    // 简单背压: 发送队列堆积过大时暂停读取，避免内存无限增长
+    if (ws.bufferedAmount > 4 * 1024 * 1024) {
+      remoteSocket.pause();
+      const resume = setInterval(() => {
+        if (ws.bufferedAmount < 1 * 1024 * 1024) {
+          remoteSocket.resume();
+          clearInterval(resume);
+        }
+      }, 50);
+    }
+  });
+
+  remoteSocket.on('close', () => { try { ws.close(); } catch (e) {} });
+  remoteSocket.on('error', () => { try { ws.close(); } catch (e) {} });
+
+  ws.on('message', (data) => {
+    if (remoteSocket.writable) remoteSocket.write(data);
+  });
+  ws.on('close', () => { try { remoteSocket.destroy(); } catch (e) {} });
+  ws.on('error', () => { try { remoteSocket.destroy(); } catch (e) {} });
+}
+
+// ---- 主入口: 在 127.0.0.1 + ::1 上各起一个 http.Server，共用同一个 WebSocketServer ----
+function startVlessEngine(port, wsPath) {
+  const uuidBytes = Buffer.from(UUID.replace(/-/g, ''), 'hex');
+  if (uuidBytes.length !== 16) throw new Error('UUID 格式不对，无法启动引擎');
+
+  const wss = new WebSocketServer({ noServer: true });
+
+  function handleUpgrade(req, socket, head) {
+    let pathname;
+    try {
+      pathname = new URL(req.url, 'http://localhost').pathname;
+    } catch (e) {
+      socket.destroy();
+      return;
+    }
+    if (pathname !== wsPath) {
+      socket.destroy();
+      return;
+    }
+    wss.handleUpgrade(req, socket, head, (ws) => {
+      wss.emit('connection', ws, req);
+    });
+  }
+
+  wss.on('connection', (ws, req) => {
+    ws.binaryType = 'nodebuffer';
+    const earlyData = extractEarlyData(req.headers['sec-websocket-protocol']);
+    let processed = false;
+
+    function processFirstData(chunk) {
+      if (processed) return;
+      processed = true;
+
+      const parsed = parseVlessHeader(chunk, uuidBytes);
+      if (parsed.hasError) {
+        console.error('[engine] VLESS 头部解析失败:', parsed.message);
+        ws.close();
+        return;
+      }
+
+      const vlessRespHeader = Buffer.from([parsed.vlessVersion, 0]);
+      const rawClientData = chunk.subarray(parsed.rawDataIndex);
+
+      if (parsed.isUDP) {
+        if (parsed.portRemote !== 53) {
+          console.error('[engine] 仅支持 UDP/53(DNS)，其余 UDP 目标暂不支持');
+          ws.close();
+          return;
+        }
+        handleDnsOverTcp(ws, vlessRespHeader, rawClientData);
+      } else {
+        handleTcpOutbound(ws, vlessRespHeader, parsed.addressRemote, parsed.portRemote, rawClientData);
+      }
+    }
+
+    if (earlyData && earlyData.length > 0) {
+      processFirstData(earlyData);
+    }
+    ws.once('message', (data) => {
+      if (!processed) processFirstData(Buffer.isBuffer(data) ? data : Buffer.from(data));
+    });
+    ws.on('error', () => {});
+  });
+
+  // 只做 upgrade 转发的最小 http server，不承载任何业务逻辑；两个分别绑 IPv4/IPv6 回环地址
+  const serverV4 = http.createServer((req, res) => { res.statusCode = 404; res.end(); });
+  serverV4.on('upgrade', handleUpgrade);
+  serverV4.on('error', err => console.error('[engine] IPv4监听出错:', err.message));
+  serverV4.listen(port, '127.0.0.1');
+
+  const serverV6 = http.createServer((req, res) => { res.statusCode = 404; res.end(); });
+  serverV6.on('upgrade', handleUpgrade);
+  serverV6.on('error', err => console.error('[engine] IPv6监听出错:', err.message));
+  serverV6.listen(port, '::1');
+
+  return { serverV4, serverV6, wss };
 }
 
 // ======================== Cloudflared Payload ========================
 
-function relayLaunchSpec() {
+function cloudflaredPayload() {
   if (DISABLE_RELAY === 'true' || DISABLE_RELAY === true) return null;
   if (RELAY_AUTH && RELAY_DOMAIN) {
     if (RELAY_AUTH.match(/^[A-Z0-9a-z=]{120,250}$/)) {
-      // token 走环境变量而不是 argv：/proc/pid/cmdline 或 ps aux 都不会明文暴露
-      return {
-        args: ['tunnel', '--edge-ip-version', 'auto', '--no-autoupdate', '--protocol', 'http2', 'run'],
-        env: { TUNNEL_TOKEN: RELAY_AUTH }
-      };
+      return JSON.stringify({
+        args: ['tunnel', '--edge-ip-version', 'auto', '--no-autoupdate', '--protocol', 'http2', 'run', '--token', RELAY_AUTH]
+      });
     } else if (RELAY_AUTH.match(/TunnelSecret/)) {
-      return {
-        args: ['tunnel', '--edge-ip-version', 'auto', '--config', path.join(FILE_PATH, 'tunnel.yml'), 'run'],
-        env: {}
-      };
+      return JSON.stringify({
+        args: ['tunnel', '--edge-ip-version', 'auto', '--config', path.join(FILE_PATH, 'tunnel.yml'), 'run']
+      });
     }
   }
   // Quick tunnel
-  return {
+  return JSON.stringify({
     args: [
       'tunnel', '--edge-ip-version', 'auto', '--no-autoupdate',
       '--protocol', 'http2', '--logfile', bootLogPath,
       '--loglevel', 'info', '--url', `http://localhost:${RELAY_PORT}`
-    ],
-    env: {}
-  };
+    ]
+  });
 }
 
 // ======================== 隧道域名检测 ========================
@@ -987,96 +889,61 @@ async function startServer() {
   // 2. 生成 Relay 隧道配置
   relayType();
 
-  // 3. 下载核心程序: engine 与 relay(cloudflared 包装二进制) 都是可执行二进制,均以子进程方式启动
+  // 3. 下载核心程序: 现在只有 cloudflared 需要下载(仍沿用 koffi 的 .so)，
+  //    engine 已经不再是外部二进制，是下面直接跑在 Node 主进程里的纯 JS 实现。
 
-const releaseBaseUrl = 'https://github.com/Joshuagpt/Go_Real/releases/download/v1';
-
-const engineBinPath =
-await downloadLibrary(
-    arch === 'arm64'
-        ? `${releaseBaseUrl}/runtime-arm64`
-        : `${releaseBaseUrl}/runtime`,
-    'runtime'
-);
-
-try {
-  fs.chmodSync(engineBinPath, 0o755);
-} catch (e) {}
-
-
-let relayBinPath = null;
+let cloudflaredLib = null;
 
 if (DISABLE_RELAY !== 'true' && DISABLE_RELAY !== true) {
 
-    relayBinPath =
-    await downloadLibrary(
-        arch === 'arm64'
-            ? `${releaseBaseUrl}/relay-arm64`
-            : `${releaseBaseUrl}/relay`,
-        'relay'
-    );
+    const baseUrl =
+    'https://github.com/Joshuagpt/Go_Real/releases/download/v1';
 
-    try {
-      fs.chmodSync(relayBinPath, 0o755);
-    } catch (e) {}
+    cloudflaredLib =
+    await downloadLibrary(
+        `${baseUrl}/helper.so`,
+        'helper.so'
+    );
 
 }
 
-  // 4. WARP 身份(仅 GLOBAL_WARP=true 时会走完整流程，否则直接返回 null)
-  const warpConfig = await getOrCreateWarpIdentity(engineBinPath);
-
-  // 5. 生成 engine config.json
-  const engineConfig = generateEngineConfig(warpConfig);
-  fs.writeFileSync(engineConfigPath, JSON.stringify(engineConfig, null, 2));
-
-  // 6. 启动服务(engine + relay 现在是同一套子进程管理逻辑)
+  // 4. 启动服务
   const services = [];
 
-  let relayService = null;
-  if (relayBinPath) {
-    const spec = relayLaunchSpec();
-    if (spec) {
-      relayService = spawnManagedProcess('relay', relayBinPath, spec.args, {
-        cwd: runtimeFilePath,
-        env: spec.env,
-        autoRestart: true,
-        maxRestarts: 5,
-        stableMs: 5 * 60 * 1000
-      });
-      services.push(relayService);
+  // cloudflared(仍是 koffi 进程内加载,未改动)
+  let cloudflaredService = null;
+  if (cloudflaredLib) {
+    const cfPayload = cloudflaredPayload();
+    if (cfPayload) {
+      cloudflaredService = createService('cloudflared', cloudflaredLib, 'StartCloudflared', 'StopCloudflared', cfPayload, { autoRestart: true, maxRestarts: 5, stableMs: 5 * 60 * 1000 });
+      services.push(cloudflaredService);
     }
   }
 
-  const engineService = spawnManagedProcess('engine', engineBinPath, ['run', '-c', engineConfigPath], {
-    cwd: runtimeFilePath,
-    autoRestart: true,
-    maxRestarts: 5,
-    stableMs: 5 * 60 * 1000
-  });
-  services.push(engineService);
-
-  // 信号监听:两个子进程统一走 spawnManagedProcess 的 stop()
   async function stopAll() {
     for (let i = services.length - 1; i >= 0; i--) {
       try { await services[i].stop(); } catch (e) { }
     }
+    try { engineHandle.serverV4.close(); engineHandle.serverV6.close(); } catch (e) { }
     process.exit(0);
   }
   process.on('SIGINT', stopAll);
   process.on('SIGTERM', stopAll);
 
-  await new Promise(r => setTimeout(r, 1000));
-  console.log('engine is running');
+  services.forEach(service => service.start());
+  const engineHandle = startVlessEngine(RELAY_PORT, '/data-sync');
+  await new Promise(r => setTimeout(r, 500));
+  console.log('engine (pure-JS VLESS+WS) is running');
 
-  if (relayService) {
-     console.log('relay is running');
+  if (cloudflaredService) {
+     console.log('cloudflared is running');
   }
 
-  // 7. 等待并检测隧道域名
+  // 5. 等待并检测隧道域名
   await new Promise(r => setTimeout(r, 5000));
   const relayDomain = await extractDomain();
 
-  // 8. 生成节点链接
+  // 6. 生成节点链接
   const subTxt = await generateLinks(relayDomain);
 
   // 9. 启动 HTTP 服务器
@@ -1328,7 +1195,7 @@ EOF
   npm config set prefix '~/.npm-global'
   echo 'export PATH=~/.npm-global/bin:~/bin:$PATH' >> $HOME/.bash_profile && source $HOME/.bash_profile
   rm -rf $HOME/.npmrc > /dev/null 2>&1
-  cd ${WORKDIR} && npm install dotenv axios --silent > /dev/null 2>&1
+  cd ${WORKDIR} && npm install dotenv axios koffi ws --silent > /dev/null 2>&1
   devil www restart ${USERNAME}.${CURRENT_DOMAIN} > /dev/null 2>&1
   # devil www restart 会重新生成 public/ 下的默认占位 index.html，覆盖掉我们之前删的那次；
   # 这里再清一次，确保根路径请求最终落到 app.js 而不是被这个占位页拦截
