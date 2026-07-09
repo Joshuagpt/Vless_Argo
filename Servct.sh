@@ -323,29 +323,41 @@ function handleDnsOverTcp(ws, vlessRespHeader, rawClientData) {
   let offset = 0;
   const buf = rawClientData;
   function sendNext() {
-    if (offset >= buf.length) return;
+    if (offset >= buf.length || offset + 2 > buf.length) return;
     const len = buf.readUInt16BE(offset);
+    if (offset + 2 + len > buf.length) return;
     const payload = buf.subarray(offset + 2, offset + 2 + len);
     offset += 2 + len;
+
+    let done = false;
+    const callNext = () => {
+      if (done) return;
+      done = true;
+      sendNext();
+    };
+
     const sock = net.connect(53, '8.8.8.8', () => {
       const lenPrefix = Buffer.alloc(2);
       lenPrefix.writeUInt16BE(payload.length);
       sock.write(Buffer.concat([lenPrefix, payload]));
     });
     sock.once('data', (respWithLen) => {
-      const dnsAnswer = respWithLen.subarray(2);
-      const frame = Buffer.alloc(2);
-      frame.writeUInt16BE(dnsAnswer.length);
-      const out = headerSent
-        ? Buffer.concat([frame, dnsAnswer])
-        : Buffer.concat([vlessRespHeader, frame, dnsAnswer]);
-      headerSent = true;
-      if (ws.readyState === ws.OPEN) ws.send(out);
+      if (respWithLen.length >= 2) {
+        const dnsAnswer = respWithLen.subarray(2);
+        const frame = Buffer.alloc(2);
+        frame.writeUInt16BE(dnsAnswer.length);
+        const out = headerSent
+          ? Buffer.concat([frame, dnsAnswer])
+          : Buffer.concat([vlessRespHeader, frame, dnsAnswer]);
+        headerSent = true;
+        if (ws.readyState === ws.OPEN) ws.send(out);
+      }
       sock.destroy();
-      sendNext();
+      callNext();
     });
-    sock.once('error', () => { sock.destroy(); sendNext(); });
-    sock.setTimeout(5000, () => sock.destroy());
+    sock.once('error', () => { sock.destroy(); callNext(); });
+    sock.once('close', () => { callNext(); });
+    sock.setTimeout(5000, () => { sock.destroy(); callNext(); });
   }
   sendNext();
 }
@@ -357,26 +369,39 @@ function handleTcpOutbound(ws, vlessRespHeader, addressRemote, portRemote, rawCl
   remoteSocket.on('connect', () => {
     if (rawClientData && rawClientData.length > 0) remoteSocket.write(rawClientData);
   });
+
+  let resumeInterval = null;
   remoteSocket.on('data', (chunk) => {
     if (ws.readyState !== ws.OPEN) return;
     const out = headerSent ? chunk : Buffer.concat([vlessRespHeader, chunk]);
     headerSent = true;
     ws.send(out, () => {});
-    if (ws.bufferedAmount > 4 * 1024 * 1024) {
+    if (ws.bufferedAmount > 4 * 1024 * 1024 && !resumeInterval) {
       remoteSocket.pause();
-      const resume = setInterval(() => {
-        if (ws.bufferedAmount < 1 * 1024 * 1024) {
+      resumeInterval = setInterval(() => {
+        if (ws.readyState !== ws.OPEN || typeof ws.bufferedAmount === 'undefined' || ws.bufferedAmount < 1 * 1024 * 1024) {
           remoteSocket.resume();
-          clearInterval(resume);
+          clearInterval(resumeInterval);
+          resumeInterval = null;
         }
       }, 50);
     }
   });
-  remoteSocket.on('close', () => { try { ws.close(); } catch (e) {} });
-  remoteSocket.on('error', () => { try { ws.close(); } catch (e) {} });
+
+  const cleanupAll = () => {
+    if (resumeInterval) {
+      clearInterval(resumeInterval);
+      resumeInterval = null;
+    }
+    try { ws.close(); } catch (e) {}
+    try { remoteSocket.destroy(); } catch (e) {}
+  };
+
+  remoteSocket.on('close', cleanupAll);
+  remoteSocket.on('error', cleanupAll);
+  ws.on('close', cleanupAll);
+  ws.on('error', cleanupAll);
   ws.on('message', (data) => { if (remoteSocket.writable) remoteSocket.write(data); });
-  ws.on('close', () => { try { remoteSocket.destroy(); } catch (e) {} });
-  ws.on('error', () => { try { remoteSocket.destroy(); } catch (e) {} });
 }
 
 const wss = new WebSocketServer({ noServer: true });
@@ -457,10 +482,9 @@ const path = require('path');
 const os = require('os');
 const http = require('http');
 const crypto = require('crypto');
-const dgram = require('dgram');
 const axios = require('axios');
 const koffi = require('koffi');
-const { spawn, spawnSync } = require('child_process');
+const { spawn } = require('child_process');
 
 try { require('dotenv').config(); } catch { /* ignore if dotenv unavailable */ }
 
@@ -757,7 +781,8 @@ function startEngine(enginePath) {
     }
     killStaleEngine();
     const startedAt = Date.now();
-    const child = spawn(process.execPath, [enginePath], {
+    // 注入 --max-old-space-size=64 硬性卡住该引擎子进程的 V8 堆上限，大幅度削减 Serv00 总运行内存常驻
+    const child = spawn(process.execPath, ['--max-old-space-size=64', enginePath], {
       cwd: runtimeFilePath,
       stdio: ['ignore', 'pipe', 'pipe'],
       env: {
@@ -973,7 +998,6 @@ async function startServer() {
   //    隧道域名(quick tunnel 最坏情况下要阻塞近 65 秒)之后，导致 Passenger
   //    在端口还没绑定时就判超时、返回500，然后在下一次请求时重新 spawn 一个
   //    全新的 app.js 进程——于是永远卡在"刚起步就被杀掉重启"的循环里。
-  //    现在先监听端口占住位置，节点信息用 state.subTxt 异步补上。
   const httpState = { subTxt: '' };
   startHttpServer(httpState);
 
