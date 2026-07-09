@@ -224,6 +224,217 @@ remove_keepalive_cron() {
   rm -f "$HOME/bin/px_monitor.sh" "$HOME/.px_health_state" 2>/dev/null
 }
 
+write_engine_js() {
+  cat > "$1" <<'ENGEOF'
+#!/usr/bin/env node
+// 独立子进程: 纯 JS VLESS+WS 引擎。之所以不直接跑在 app.js 里，是因为 Phusion Passenger
+// 的 Node "auto-install" 机制会把进程里第一次调用 .listen() 的 http.Server 自动接管当成
+// 自己的请求入口，同一个进程里不允许出现第二次 .listen()。engine 独立成子进程后，它的
+// .listen() 调用发生在另一个 OS 进程里，Passenger 完全看不到，不会冲突；副作用是内存
+// 核算也更干净，能单独用 --max-old-space-size 卡住这个进程自己的堆。
+
+const http = require('http');
+const net = require('net');
+const { WebSocketServer } = require('ws');
+
+const UUID = process.env.UUID || '';
+const RELAY_PORT = Number(process.env.RELAY_PORT) || 8001;
+const WS_PATH = process.env.WS_PATH || '/data-sync';
+
+const uuidBytes = Buffer.from(UUID.replace(/-/g, ''), 'hex');
+if (uuidBytes.length !== 16) {
+  console.error('[engine] UUID 格式不对，无法启动');
+  process.exit(1);
+}
+
+// ---- VLESS 头部解析 ----
+function parseVlessHeader(buffer, expectedUUIDBytes) {
+  if (buffer.length < 24) {
+    return { hasError: true, message: 'VLESS 头部太短' };
+  }
+  const version = buffer[0];
+  const uuidBytesIn = buffer.subarray(1, 17);
+  if (!uuidBytesIn.equals(expectedUUIDBytes)) {
+    return { hasError: true, message: 'UUID 校验失败' };
+  }
+  const optLen = buffer[17];
+  let offset = 18 + optLen;
+  const command = buffer[offset];
+  offset += 1;
+  if (command !== 1 && command !== 2) {
+    return { hasError: true, message: `不支持的 command: ${command}` };
+  }
+  const isUDP = command === 2;
+  const port = buffer.readUInt16BE(offset);
+  offset += 2;
+  const addressType = buffer[offset];
+  offset += 1;
+  let addressRemote = '';
+  if (addressType === 1) {
+    addressRemote = buffer.subarray(offset, offset + 4).join('.');
+    offset += 4;
+  } else if (addressType === 2) {
+    const domainLen = buffer[offset];
+    offset += 1;
+    addressRemote = buffer.subarray(offset, offset + domainLen).toString('utf8');
+    offset += domainLen;
+  } else if (addressType === 3) {
+    const parts = [];
+    for (let i = 0; i < 8; i++) {
+      parts.push(buffer.readUInt16BE(offset).toString(16));
+      offset += 2;
+    }
+    addressRemote = parts.join(':');
+  } else {
+    return { hasError: true, message: `不支持的地址类型: ${addressType}` };
+  }
+  return {
+    hasError: false, addressRemote, addressType, portRemote: port,
+    isUDP, vlessVersion: version, rawDataIndex: offset
+  };
+}
+
+function extractEarlyData(secWsProtocolHeader) {
+  if (!secWsProtocolHeader) return null;
+  try {
+    let b64 = secWsProtocolHeader.replace(/-/g, '+').replace(/_/g, '/');
+    while (b64.length % 4 !== 0) b64 += '=';
+    return Buffer.from(b64, 'base64');
+  } catch (e) {
+    return null;
+  }
+}
+
+function handleDnsOverTcp(ws, vlessRespHeader, rawClientData) {
+  let headerSent = false;
+  let offset = 0;
+  const buf = rawClientData;
+  function sendNext() {
+    if (offset >= buf.length) return;
+    const len = buf.readUInt16BE(offset);
+    const payload = buf.subarray(offset + 2, offset + 2 + len);
+    offset += 2 + len;
+    const sock = net.connect(53, '8.8.8.8', () => {
+      const lenPrefix = Buffer.alloc(2);
+      lenPrefix.writeUInt16BE(payload.length);
+      sock.write(Buffer.concat([lenPrefix, payload]));
+    });
+    sock.once('data', (respWithLen) => {
+      const dnsAnswer = respWithLen.subarray(2);
+      const frame = Buffer.alloc(2);
+      frame.writeUInt16BE(dnsAnswer.length);
+      const out = headerSent
+        ? Buffer.concat([frame, dnsAnswer])
+        : Buffer.concat([vlessRespHeader, frame, dnsAnswer]);
+      headerSent = true;
+      if (ws.readyState === ws.OPEN) ws.send(out);
+      sock.destroy();
+      sendNext();
+    });
+    sock.once('error', () => { sock.destroy(); sendNext(); });
+    sock.setTimeout(5000, () => sock.destroy());
+  }
+  sendNext();
+}
+
+function handleTcpOutbound(ws, vlessRespHeader, addressRemote, portRemote, rawClientData) {
+  let headerSent = false;
+  const remoteSocket = net.connect(portRemote, addressRemote);
+  remoteSocket.setNoDelay(true);
+  remoteSocket.on('connect', () => {
+    if (rawClientData && rawClientData.length > 0) remoteSocket.write(rawClientData);
+  });
+  remoteSocket.on('data', (chunk) => {
+    if (ws.readyState !== ws.OPEN) return;
+    const out = headerSent ? chunk : Buffer.concat([vlessRespHeader, chunk]);
+    headerSent = true;
+    ws.send(out, () => {});
+    if (ws.bufferedAmount > 4 * 1024 * 1024) {
+      remoteSocket.pause();
+      const resume = setInterval(() => {
+        if (ws.bufferedAmount < 1 * 1024 * 1024) {
+          remoteSocket.resume();
+          clearInterval(resume);
+        }
+      }, 50);
+    }
+  });
+  remoteSocket.on('close', () => { try { ws.close(); } catch (e) {} });
+  remoteSocket.on('error', () => { try { ws.close(); } catch (e) {} });
+  ws.on('message', (data) => { if (remoteSocket.writable) remoteSocket.write(data); });
+  ws.on('close', () => { try { remoteSocket.destroy(); } catch (e) {} });
+  ws.on('error', () => { try { remoteSocket.destroy(); } catch (e) {} });
+}
+
+const wss = new WebSocketServer({ noServer: true });
+
+function handleUpgrade(req, socket, head) {
+  let pathname;
+  try {
+    pathname = new URL(req.url, 'http://localhost').pathname;
+  } catch (e) {
+    socket.destroy();
+    return;
+  }
+  if (pathname !== WS_PATH) {
+    socket.destroy();
+    return;
+  }
+  wss.handleUpgrade(req, socket, head, (ws) => {
+    wss.emit('connection', ws, req);
+  });
+}
+
+wss.on('connection', (ws, req) => {
+  ws.binaryType = 'nodebuffer';
+  const earlyData = extractEarlyData(req.headers['sec-websocket-protocol']);
+  let processed = false;
+
+  function processFirstData(chunk) {
+    if (processed) return;
+    processed = true;
+    const parsed = parseVlessHeader(chunk, uuidBytes);
+    if (parsed.hasError) {
+      console.error('[engine] VLESS 头部解析失败:', parsed.message);
+      ws.close();
+      return;
+    }
+    const vlessRespHeader = Buffer.from([parsed.vlessVersion, 0]);
+    const rawClientData = chunk.subarray(parsed.rawDataIndex);
+    if (parsed.isUDP) {
+      if (parsed.portRemote !== 53) {
+        console.error('[engine] 仅支持 UDP/53(DNS)，其余 UDP 目标暂不支持');
+        ws.close();
+        return;
+      }
+      handleDnsOverTcp(ws, vlessRespHeader, rawClientData);
+    } else {
+      handleTcpOutbound(ws, vlessRespHeader, parsed.addressRemote, parsed.portRemote, rawClientData);
+    }
+  }
+
+  if (earlyData && earlyData.length > 0) processFirstData(earlyData);
+  ws.once('message', (data) => {
+    if (!processed) processFirstData(Buffer.isBuffer(data) ? data : Buffer.from(data));
+  });
+  ws.on('error', () => {});
+});
+
+const serverV4 = http.createServer((req, res) => { res.statusCode = 404; res.end(); });
+serverV4.on('upgrade', handleUpgrade);
+serverV4.on('error', err => console.error('[engine] IPv4监听出错:', err.message));
+serverV4.listen(RELAY_PORT, '127.0.0.1', () => console.log(`[engine] listening on 127.0.0.1:${RELAY_PORT}`));
+
+const serverV6 = http.createServer((req, res) => { res.statusCode = 404; res.end(); });
+serverV6.on('upgrade', handleUpgrade);
+serverV6.on('error', err => console.error('[engine] IPv6监听出错:', err.message));
+serverV6.listen(RELAY_PORT, '::1', () => console.log(`[engine] listening on ::1:${RELAY_PORT}`));
+
+process.on('SIGINT', () => process.exit(0));
+process.on('SIGTERM', () => process.exit(0));
+ENGEOF
+}
+
 write_app_js() {
   cat > "$1" <<'JSEOF'
 #!/usr/bin/env node
@@ -232,12 +443,10 @@ const fs = require('fs');
 const path = require('path');
 const os = require('os');
 const http = require('http');
-const net = require('net');
 const crypto = require('crypto');
 const dgram = require('dgram');
 const axios = require('axios');
 const koffi = require('koffi');
-const { WebSocketServer } = require('ws');
 const { spawn, spawnSync } = require('child_process');
 
 try { require('dotenv').config(); } catch { /* ignore if dotenv unavailable */ }
@@ -478,242 +687,49 @@ function createService(name, libraryPath, startSymbol, stopSymbol, payload, rest
   };
 }
 
-// ======================== 纯 JS VLESS+WS 引擎(替代 xray-core 子进程) ========================
-// 只做 VLESS 协议本身需要的最小事情：解析头部 -> 建立到目标的 TCP 连接 -> 双向转发字节。
-// 不做路由规则、不做多用户、不做 Reality/TLS 分流、不支持 WARP(wireguard)——这些都不在
-// 这次范围内。cloudflared 仍然是独立的 koffi 进程内加载，完全没有改动。
-//
-// 监听方式: 绑 127.0.0.1 + ::1 上的 RELAY_PORT，和原来 xray inbound 的绑定方式保持一致，
-// cloudflared 通过 http://localhost:${RELAY_PORT} 反向连过来。
+// ======================== engine 子进程管理 ========================
+// engine 现在是独立的 node 子进程(engine.js)，原因见 engine.js 顶部注释：
+// Phusion Passenger 的 auto-install 机制不允许同一个 Node 进程里出现第二次 .listen()。
+// 复用跟 cloudflared 一样的滑动窗口重启逻辑；崩溃只会影响这一个子进程，不牵连 Node 主进程。
+function startEngine(enginePath) {
+  const guard = createRestartGuard(5, 5 * 60 * 1000);
 
-// ---- VLESS 头部解析 ----
-// 格式: 1字节version + 16字节UUID + 1字节addons长度M + M字节addons(忽略)
-//      + 1字节command(1=TCP,2=UDP) + 2字节port(大端) + 1字节地址类型(1=IPv4,2=域名,3=IPv6)
-//      + 地址本体 + 剩余为首包payload
-function parseVlessHeader(buffer, expectedUUIDBytes) {
-  if (buffer.length < 24) {
-    return { hasError: true, message: 'VLESS 头部太短' };
-  }
-
-  const version = buffer[0];
-  const uuidBytes = buffer.subarray(1, 17);
-  if (!uuidBytes.equals(expectedUUIDBytes)) {
-    return { hasError: true, message: 'UUID 校验失败' };
-  }
-
-  const optLen = buffer[17];
-  let offset = 18 + optLen;
-
-  const command = buffer[offset]; // 1=TCP 2=UDP 3=MUX
-  offset += 1;
-  if (command !== 1 && command !== 2) {
-    return { hasError: true, message: `不支持的 command: ${command}` };
-  }
-  const isUDP = command === 2;
-
-  const port = buffer.readUInt16BE(offset);
-  offset += 2;
-
-  const addressType = buffer[offset];
-  offset += 1;
-
-  let addressRemote = '';
-  if (addressType === 1) { // IPv4
-    addressRemote = buffer.subarray(offset, offset + 4).join('.');
-    offset += 4;
-  } else if (addressType === 2) { // 域名
-    const domainLen = buffer[offset];
-    offset += 1;
-    addressRemote = buffer.subarray(offset, offset + domainLen).toString('utf8');
-    offset += domainLen;
-  } else if (addressType === 3) { // IPv6
-    const parts = [];
-    for (let i = 0; i < 8; i++) {
-      parts.push(buffer.readUInt16BE(offset).toString(16));
-      offset += 2;
-    }
-    addressRemote = parts.join(':');
-  } else {
-    return { hasError: true, message: `不支持的地址类型: ${addressType}` };
-  }
-
-  return {
-    hasError: false,
-    addressRemote,
-    addressType,
-    portRemote: port,
-    isUDP,
-    vlessVersion: version,
-    rawDataIndex: offset // 首包 payload 从这里开始
-  };
-}
-
-// ---- 0-RTT early data: 从 Sec-WebSocket-Protocol 头里取 base64url 编码的首包 ----
-function extractEarlyData(secWsProtocolHeader) {
-  if (!secWsProtocolHeader) return null;
-  try {
-    let b64 = secWsProtocolHeader.replace(/-/g, '+').replace(/_/g, '/');
-    while (b64.length % 4 !== 0) b64 += '=';
-    return Buffer.from(b64, 'base64');
-  } catch (e) {
-    return null;
-  }
-}
-
-// ---- DNS-over-TCP 转发(处理 command=UDP 且目标端口 53 的场景) ----
-// VLESS UDP 帧格式: 2字节长度 + payload，可能一个 WS 消息里有多个帧
-function handleDnsOverTcp(ws, vlessRespHeader, rawClientData) {
-  let headerSent = false;
-  let offset = 0;
-  const buf = rawClientData;
-
-  function sendNext() {
-    if (offset >= buf.length) return;
-    const len = buf.readUInt16BE(offset);
-    const payload = buf.subarray(offset + 2, offset + 2 + len);
-    offset += 2 + len;
-
-    // 标准 DNS-over-TCP 需要在查询前加 2 字节长度前缀(RFC1035)；
-    // 这里直连 8.8.8.8:53 走 TCP DNS，避免依赖不存在的 UDP 出站能力
-    const sock = net.connect(53, '8.8.8.8', () => {
-      const lenPrefix = Buffer.alloc(2);
-      lenPrefix.writeUInt16BE(payload.length);
-      sock.write(Buffer.concat([lenPrefix, payload]));
-    });
-    sock.once('data', (respWithLen) => {
-      const dnsAnswer = respWithLen.subarray(2);
-      const frame = Buffer.alloc(2);
-      frame.writeUInt16BE(dnsAnswer.length);
-      const out = headerSent
-        ? Buffer.concat([frame, dnsAnswer])
-        : Buffer.concat([vlessRespHeader, frame, dnsAnswer]);
-      headerSent = true;
-      if (ws.readyState === ws.OPEN) ws.send(out);
-      sock.destroy();
-      sendNext();
-    });
-    sock.once('error', () => { sock.destroy(); sendNext(); });
-    sock.setTimeout(5000, () => sock.destroy());
-  }
-
-  sendNext();
-}
-
-// ---- TCP 出站: 建立到目标的连接，双向转发 ----
-function handleTcpOutbound(ws, vlessRespHeader, addressRemote, portRemote, rawClientData) {
-  let headerSent = false;
-  const remoteSocket = net.connect(portRemote, addressRemote);
-  remoteSocket.setNoDelay(true);
-
-  remoteSocket.on('connect', () => {
-    if (rawClientData && rawClientData.length > 0) {
-      remoteSocket.write(rawClientData);
-    }
-  });
-
-  remoteSocket.on('data', (chunk) => {
-    if (ws.readyState !== ws.OPEN) return;
-    const out = headerSent ? chunk : Buffer.concat([vlessRespHeader, chunk]);
-    headerSent = true;
-    ws.send(out, () => {});
-    // 简单背压: 发送队列堆积过大时暂停读取，避免内存无限增长
-    if (ws.bufferedAmount > 4 * 1024 * 1024) {
-      remoteSocket.pause();
-      const resume = setInterval(() => {
-        if (ws.bufferedAmount < 1 * 1024 * 1024) {
-          remoteSocket.resume();
-          clearInterval(resume);
-        }
-      }, 50);
-    }
-  });
-
-  remoteSocket.on('close', () => { try { ws.close(); } catch (e) {} });
-  remoteSocket.on('error', () => { try { ws.close(); } catch (e) {} });
-
-  ws.on('message', (data) => {
-    if (remoteSocket.writable) remoteSocket.write(data);
-  });
-  ws.on('close', () => { try { remoteSocket.destroy(); } catch (e) {} });
-  ws.on('error', () => { try { remoteSocket.destroy(); } catch (e) {} });
-}
-
-// ---- 主入口: 在 127.0.0.1 + ::1 上各起一个 http.Server，共用同一个 WebSocketServer ----
-function startVlessEngine(port, wsPath) {
-  const uuidBytes = Buffer.from(UUID.replace(/-/g, ''), 'hex');
-  if (uuidBytes.length !== 16) throw new Error('UUID 格式不对，无法启动引擎');
-
-  const wss = new WebSocketServer({ noServer: true });
-
-  function handleUpgrade(req, socket, head) {
-    let pathname;
-    try {
-      pathname = new URL(req.url, 'http://localhost').pathname;
-    } catch (e) {
-      socket.destroy();
-      return;
-    }
-    if (pathname !== wsPath) {
-      socket.destroy();
-      return;
-    }
-    wss.handleUpgrade(req, socket, head, (ws) => {
-      wss.emit('connection', ws, req);
-    });
-  }
-
-  wss.on('connection', (ws, req) => {
-    ws.binaryType = 'nodebuffer';
-    const earlyData = extractEarlyData(req.headers['sec-websocket-protocol']);
-    let processed = false;
-
-    function processFirstData(chunk) {
-      if (processed) return;
-      processed = true;
-
-      const parsed = parseVlessHeader(chunk, uuidBytes);
-      if (parsed.hasError) {
-        console.error('[engine] VLESS 头部解析失败:', parsed.message);
-        ws.close();
-        return;
+  function spawnOnce() {
+    const startedAt = Date.now();
+    const child = spawn(process.execPath, [enginePath], {
+      cwd: runtimeFilePath,
+      stdio: ['ignore', 'pipe', 'pipe'],
+      env: {
+        ...process.env,
+        UUID,
+        RELAY_PORT: String(RELAY_PORT),
+        WS_PATH: '/data-sync'
       }
+    });
 
-      const vlessRespHeader = Buffer.from([parsed.vlessVersion, 0]);
-      const rawClientData = chunk.subarray(parsed.rawDataIndex);
+    child.stdout.on('data', d => process.stdout.write(`[engine] ${d}`));
+    child.stderr.on('data', d => process.stderr.write(`[engine] ${d}`));
 
-      if (parsed.isUDP) {
-        if (parsed.portRemote !== 53) {
-          console.error('[engine] 仅支持 UDP/53(DNS)，其余 UDP 目标暂不支持');
-          ws.close();
-          return;
-        }
-        handleDnsOverTcp(ws, vlessRespHeader, rawClientData);
+    child.on('error', err => {
+      console.error('engine 子进程启动失败:', err.message);
+    });
+
+    child.on('exit', (code, signal) => {
+      const aliveMs = Date.now() - startedAt;
+      console.error(`engine 子进程退出(code=${code}, signal=${signal}, 存活${Math.round(aliveMs / 1000)}秒)`);
+      if (guard.shouldRestart(aliveMs)) {
+        console.error(`engine 将在2秒后自动重启(第${guard.count}/${guard.max}次)`);
+        setTimeout(spawnOnce, 2000);
       } else {
-        handleTcpOutbound(ws, vlessRespHeader, parsed.addressRemote, parsed.portRemote, rawClientData);
+        console.error('engine 短时间内反复崩溃且重启次数已达上限，不再重启');
+        notifyFatal(`engine 反复崩溃，已停止自动重启(连续在5分钟内失败${guard.max}次)`);
       }
-    }
-
-    if (earlyData && earlyData.length > 0) {
-      processFirstData(earlyData);
-    }
-    ws.once('message', (data) => {
-      if (!processed) processFirstData(Buffer.isBuffer(data) ? data : Buffer.from(data));
     });
-    ws.on('error', () => {});
-  });
 
-  // 只做 upgrade 转发的最小 http server，不承载任何业务逻辑；两个分别绑 IPv4/IPv6 回环地址
-  const serverV4 = http.createServer((req, res) => { res.statusCode = 404; res.end(); });
-  serverV4.on('upgrade', handleUpgrade);
-  serverV4.on('error', err => console.error('[engine] IPv4监听出错:', err.message));
-  serverV4.listen(port, '127.0.0.1');
+    return child;
+  }
 
-  const serverV6 = http.createServer((req, res) => { res.statusCode = 404; res.end(); });
-  serverV6.on('upgrade', handleUpgrade);
-  serverV6.on('error', err => console.error('[engine] IPv6监听出错:', err.message));
-  serverV6.listen(port, '::1');
-
-  return { serverV4, serverV6, wss };
+  return spawnOnce();
 }
 
 // ======================== Cloudflared Payload ========================
@@ -889,8 +905,9 @@ async function startServer() {
   // 2. 生成 Relay 隧道配置
   relayType();
 
-  // 3. 下载核心程序: 现在只有 cloudflared 需要下载(仍沿用 koffi 的 .so)，
-  //    engine 已经不再是外部二进制，是下面直接跑在 Node 主进程里的纯 JS 实现。
+  // 3. 下载核心程序: 现在只有 cloudflared 需要下载(仍沿用 koffi 的 .so)。
+  //    engine 是独立子进程(engine.js)，见其文件顶部注释，原因是 Passenger 的
+  //    auto-install 机制不允许同一个 Node 进程里出现第二次 .listen()。
 
 let cloudflaredLib = null;
 
@@ -920,20 +937,21 @@ if (DISABLE_RELAY !== 'true' && DISABLE_RELAY !== true) {
     }
   }
 
+  let engineChild = null;
   async function stopAll() {
     for (let i = services.length - 1; i >= 0; i--) {
       try { await services[i].stop(); } catch (e) { }
     }
-    try { engineHandle.serverV4.close(); engineHandle.serverV6.close(); } catch (e) { }
+    try { if (engineChild) engineChild.kill(); } catch (e) { }
     process.exit(0);
   }
   process.on('SIGINT', stopAll);
   process.on('SIGTERM', stopAll);
 
   services.forEach(service => service.start());
-  const engineHandle = startVlessEngine(RELAY_PORT, '/data-sync');
+  engineChild = startEngine(path.resolve(__dirname, 'engine.js'));
   await new Promise(r => setTimeout(r, 500));
-  console.log('engine (pure-JS VLESS+WS) is running');
+  console.log('engine (pure-JS VLESS+WS, child process) is running');
 
   if (cloudflaredService) {
      console.log('cloudflared is running');
@@ -972,6 +990,7 @@ install_service () {
     # 永远会被这个占位页拦截，走不到 Node app.js
     rm -f "${WORKDIR}/public/index.html" > /dev/null 2>&1
     write_app_js "${WORKDIR}/app.js"
+    write_engine_js "${WORKDIR}/engine.js"
     chmod +x "${WORKDIR}/app.js"
 
     cat > "${WORKDIR}/index.html" <<'HTMLEOF'
