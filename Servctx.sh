@@ -234,37 +234,11 @@ const os = require('os');
 const http = require('http');
 const crypto = require('crypto');
 const dgram = require('dgram');
-const stream = require('stream/promises');
-const { Readable } = require('stream');
+const axios = require('axios');
 const koffi = require('koffi');
 const { spawn, spawnSync } = require('child_process');
 
 try { require('dotenv').config(); } catch { /* ignore if dotenv unavailable */ }
-
-// ======================== 内存优化: Go 运行时 GC 调优 ========================
-// engine(xray,独立子进程) 和 cloudflared(helper.so,koffi 进程内加载,和 Node 共享 env)
-// 都是 Go 写的,默认 GOGC=100 意味着堆允许长到"存活对象的2倍"才触发一次GC,内存越宽松RSS越高。
-// 这里调低GOGC、给GOMEMLIMIT封顶,用一点CPU换内存,对这种轻量转发/隧道场景比较划算。
-// 必须在 koffi.load(helper.so) 之前设置——Go runtime 只在初始化时读一次这两个环境变量。
-// spawn() 默认不传 env 时会继承 process.env,所以 engine 子进程也会一并吃到,不用单独传。
-process.env.GOGC = process.env.GOGC || '40';
-process.env.GOMEMLIMIT = process.env.GOMEMLIMIT || '48MiB';
-
-// 用内置 fetch 替代 axios 的极简封装: 只覆盖这个脚本实际用到的 GET/POST JSON 场景,
-// 少一个 axios(以及它连带的 follow-redirects/form-data/proxy-from-env 等依赖)。
-async function fetchJson(url, options = {}) {
-  const { method = 'GET', headers = {}, body, timeoutMs = 10000 } = options;
-  const res = await fetch(url, {
-    method,
-    headers: body ? { 'Content-Type': 'application/json', ...headers } : headers,
-    body: body ? JSON.stringify(body) : undefined,
-    signal: AbortSignal.timeout(timeoutMs)
-  });
-  if (!res.ok) {
-    throw new Error(`HTTP ${res.status} for ${url}`);
-  }
-  return res.json();
-}
 
 // ======================== 环境变量定义 ========================
 const FILE_PATH      = process.env.FILE_PATH      || '.npm';     // sub.txt订阅文件路径
@@ -408,22 +382,20 @@ function generateWireguardKeyPair() {
 async function registerWarp() {
   const { privateKey, publicKey } = generateWireguardKeyPair();
 
-  const resp = await fetchJson(WARP_REG_URL, {
-    method: 'POST',
+  const resp = await axios.post(WARP_REG_URL, {
+    key: publicKey,
+    install_id: '',
+    fcm_token: '',
+    tos: new Date().toISOString(),
+    type: 'PC',
+    model: 'PC',
+    locale: 'en_US'
+  }, {
     headers: WARP_API_HEADERS,
-    timeoutMs: 10000,
-    body: {
-      key: publicKey,
-      install_id: '',
-      fcm_token: '',
-      tos: new Date().toISOString(),
-      type: 'PC',
-      model: 'PC',
-      locale: 'en_US'
-    }
+    timeout: 10000
   });
 
-  const data = resp;
+  const data = resp.data;
   if (!data || !data.config || !data.config.peers || !data.config.peers[0]) {
     throw new Error('WARP注册接口返回数据格式异常');
   }
@@ -672,13 +644,14 @@ async function downloadLibrary(url, fileName, expectedSha256) {
   }
   await fs.promises.mkdir(libraryDir, { recursive: true });
   const tmp = path.resolve(libraryDir, `${fileName}.download`);
+  const writer = fs.createWriteStream(tmp);
   console.log(`Downloading ${url} -> ${target}`);
-  const res = await fetch(url, { signal: AbortSignal.timeout(3 * 60 * 1000) });
-  if (!res.ok) {
-    throw new Error(`Failed to download ${url}: HTTP ${res.status}`);
+  const response = await axios.get(url, { responseType: 'stream', timeout: 3 * 60 * 1000 });
+  if (response.status < 200 || response.status >= 300) {
+    throw new Error(`Failed to download ${url}: HTTP ${response.status}`);
   }
-  // 流式落盘,不把整个文件先缓冲进内存(启动阶段峰值内存更低)
-  await stream.pipeline(Readable.fromWeb(res.body), fs.createWriteStream(tmp));
+  response.data.pipe(writer);
+  await new Promise((resolve, reject) => writer.on('finish', resolve).on('error', reject));
   if (!(await sha256Matches(tmp, expectedSha256))) {
     throw new Error(`SHA-256 mismatch for ${tmp}`);
   }
@@ -693,11 +666,10 @@ async function downloadLibrary(url, fileName, expectedSha256) {
 async function notifyFatal(message) {
   if (!TG_BOT_TOKEN || !TG_CHAT_ID) return;
   try {
-    await fetchJson(`https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage`, {
-      method: 'POST',
-      timeoutMs: 5000,
-      body: { chat_id: TG_CHAT_ID, text: `[${os.hostname()}] ${message}` }
-    });
+    await axios.post(`https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage`, {
+      chat_id: TG_CHAT_ID,
+      text: `[${os.hostname()}] ${message}`
+    }, { timeout: 5000 });
   } catch (e) {
     console.error('Telegram 通知发送失败:', e.message);
   }
@@ -944,15 +916,15 @@ async function extractDomain() {
 
 async function getMetaInfo() {
   try {
-    const data1 = await fetchJson('https://api.ip.sb/geoip', { headers: { 'User-Agent': 'Mozilla/5.0' }, timeoutMs: 3000 });
-    if (data1 && data1.country_code && data1.isp) {
-      return `${data1.country_code}-${data1.isp}`.replace(/\s+/g, '_');
+    const response1 = await axios.get('https://api.ip.sb/geoip', { headers: { 'User-Agent': 'Mozilla/5.0', timeout: 3000 } });
+    if (response1.data && response1.data.country_code && response1.data.isp) {
+      return `${response1.data.country_code}-${response1.data.isp}`.replace(/\s+/g, '_');
     }
   } catch (error) {
     try {
-      const data2 = await fetchJson('http://ip-api.com/json', { headers: { 'User-Agent': 'Mozilla/5.0' }, timeoutMs: 3000 });
-      if (data2 && data2.status === 'success' && data2.countryCode && data2.org) {
-        return `${data2.countryCode}-${data2.org}`.replace(/\s+/g, '_');
+      const response2 = await axios.get('http://ip-api.com/json', { headers: { 'User-Agent': 'Mozilla/5.0', timeout: 3000 } });
+      if (response2.data && response2.data.status === 'success' && response2.data.countryCode && response2.data.org) {
+        return `${response2.data.countryCode}-${response2.data.org}`.replace(/\s+/g, '_');
       }
     } catch (error) { /* backup also failed */ }
   }
@@ -1366,36 +1338,13 @@ ${TG_BOT_TOKEN:+TG_BOT_TOKEN=$TG_BOT_TOKEN}
 ${TG_CHAT_ID:+TG_CHAT_ID=$TG_CHAT_ID}
 EOF
 
-  # 内存优化: Passenger/devil 通过 PATH 里的 ~/bin/node 找 node 可执行文件(前面这个软链本来就是为了让它选中24版本)。
-  # 直接把软链换成一个 wrapper,注入 --max-old-space-size/--max-semi-space-size,
-  # 让 V8 的 old-space/semi-space 上限更小、GC 更勤快,以更高的GC频率(用一点CPU)换取更低的常驻内存。
-  # 这样不管 Passenger 具体是怎么拉起 app.js 的,只要它是通过这个 node 找到的可执行文件,限制就一定生效。
-  mkdir -p ~/bin
-  cat > ~/bin/node <<'NODEWRAP'
-#!/bin/bash
-exec /usr/local/bin/node24 --max-old-space-size=64 --max-semi-space-size=4 "$@"
-NODEWRAP
-  chmod +x ~/bin/node
+  ln -fs /usr/local/bin/node24 ~/bin/node > /dev/null 2>&1
   ln -fs /usr/local/bin/npm24 ~/bin/npm > /dev/null 2>&1
   mkdir -p ~/.npm-global
   npm config set prefix '~/.npm-global'
   echo 'export PATH=~/.npm-global/bin:~/bin:$PATH' >> $HOME/.bash_profile && source $HOME/.bash_profile
   rm -rf $HOME/.npmrc > /dev/null 2>&1
-  cd ${WORKDIR}
-  npm install dotenv koffi --silent > /dev/null 2>&1 &
-  npm_pid=$!
-  spin='⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏'
-  i=0
-  elapsed=0
-  while kill -0 $npm_pid 2>/dev/null; do
-    i=$(( (i+1) % ${#spin} ))
-    printf "\r${yellow}正在安装 npm 依赖 %s (已用时 %ss)${re}" "${spin:$i:1}" "$elapsed"
-    sleep 1
-    elapsed=$((elapsed+1))
-  done
-  wait $npm_pid
-  printf "\r\033[K"
-  green "npm 依赖安装完成(用时 ${elapsed}s)"
+  cd ${WORKDIR} && npm install dotenv axios koffi --silent > /dev/null 2>&1
   devil www restart ${USERNAME}.${CURRENT_DOMAIN} > /dev/null 2>&1
   # devil www restart 会重新生成 public/ 下的默认占位 index.html，覆盖掉我们之前删的那次；
   # 这里再清一次，确保根路径请求最终落到 app.js 而不是被这个占位页拦截
@@ -1403,7 +1352,7 @@ NODEWRAP
 
   yellow "服务启动中，首次启动需要下载运行库，请耐心等待...."
   started=false
-  for i in $(seq 1 30); do
+  for i in $(seq 1 15); do
     sleep 3
     # devil 每次 restart 都可能重新放回占位页，起服务的这段时间里持续清理，
     # 避免探测阶段命中占位页而不是真实的 app.js 响应
