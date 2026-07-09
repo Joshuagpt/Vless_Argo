@@ -972,6 +972,7 @@ install_service () {
     # 永远会被这个占位页拦截，走不到 Node app.js
     rm -f "${WORKDIR}/public/index.html" > /dev/null 2>&1
     write_app_js "${WORKDIR}/app.js"
+    chmod +x "${WORKDIR}/app.js"
 
     cat > "${WORKDIR}/index.html" <<'HTMLEOF'
 <!DOCTYPE html>
