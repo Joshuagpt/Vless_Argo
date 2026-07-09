@@ -241,6 +241,19 @@ const UUID = process.env.UUID || '';
 const RELAY_PORT = Number(process.env.RELAY_PORT) || 8001;
 const WS_PATH = process.env.WS_PATH || '/data-sync';
 
+// 把自己的 PID 写到当前目录(cwd 是 runtimeFilePath)下的 engine.pid，
+// 给 app.js 下次启动时用来清理上一轮可能残留的孤儿进程(见 app.js 里 startEngine 的说明)
+const fs = require('fs');
+const pidFilePath = 'engine.pid';
+try { fs.writeFileSync(pidFilePath, String(process.pid)); } catch (e) { /* ignore */ }
+function cleanupPidFile() {
+  try {
+    if (fs.readFileSync(pidFilePath, 'utf8').trim() === String(process.pid)) {
+      fs.unlinkSync(pidFilePath);
+    }
+  } catch (e) { /* ignore */ }
+}
+
 const uuidBytes = Buffer.from(UUID.replace(/-/g, ''), 'hex');
 if (uuidBytes.length !== 16) {
   console.error('[engine] UUID 格式不对，无法启动');
@@ -430,8 +443,8 @@ serverV6.on('upgrade', handleUpgrade);
 serverV6.on('error', err => console.error('[engine] IPv6监听出错:', err.message));
 serverV6.listen(RELAY_PORT, '::1', () => console.log(`[engine] listening on ::1:${RELAY_PORT}`));
 
-process.on('SIGINT', () => process.exit(0));
-process.on('SIGTERM', () => process.exit(0));
+process.on('SIGINT', () => { cleanupPidFile(); process.exit(0); });
+process.on('SIGTERM', () => { cleanupPidFile(); process.exit(0); });
 ENGEOF
 }
 
@@ -691,10 +704,25 @@ function createService(name, libraryPath, startSymbol, stopSymbol, payload, rest
 // engine 现在是独立的 node 子进程(engine.js)，原因见 engine.js 顶部注释：
 // Phusion Passenger 的 auto-install 机制不允许同一个 Node 进程里出现第二次 .listen()。
 // 复用跟 cloudflared 一样的滑动窗口重启逻辑；崩溃只会影响这一个子进程，不牵连 Node 主进程。
+function killStaleEngine() {
+  const pidFilePath = path.resolve(runtimeFilePath, 'engine.pid');
+  try {
+    const oldPid = Number(fs.readFileSync(pidFilePath, 'utf8').trim());
+    if (oldPid && oldPid !== process.pid) {
+      process.kill(oldPid, 'SIGKILL');
+      console.log(`engine: 已清理上一轮残留的孤儿进程(PID ${oldPid})`);
+    }
+  } catch (e) {
+    // 文件不存在，或者进程已经不在了(ESRCH)，都属于正常情况，忽略
+  }
+  try { fs.unlinkSync(pidFilePath); } catch (e) { /* ignore */ }
+}
+
 function startEngine(enginePath) {
   const guard = createRestartGuard(5, 5 * 60 * 1000);
 
   function spawnOnce() {
+    killStaleEngine();
     const startedAt = Date.now();
     const child = spawn(process.execPath, [enginePath], {
       cwd: runtimeFilePath,
