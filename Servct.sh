@@ -342,9 +342,9 @@ function handleDnsOverTcp(ws, vlessRespHeader, rawClientData) {
       headerSent = true;
       if (ws.readyState === ws.OPEN) ws.send(out);
       sock.destroy();
-      sendNext();
     });
-    sock.once('error', () => { sock.destroy(); sendNext(); });
+    sock.once('close', () => { sendNext(); });
+    sock.once('error', () => { sock.destroy(); });
     sock.setTimeout(5000, () => sock.destroy());
   }
   sendNext();
@@ -352,8 +352,20 @@ function handleDnsOverTcp(ws, vlessRespHeader, rawClientData) {
 
 function handleTcpOutbound(ws, vlessRespHeader, addressRemote, portRemote, rawClientData) {
   let headerSent = false;
+  let backpressureInterval = null;
+
   const remoteSocket = net.connect(portRemote, addressRemote);
   remoteSocket.setNoDelay(true);
+
+  function cleanup() {
+    if (backpressureInterval) {
+      clearInterval(backpressureInterval);
+      backpressureInterval = null;
+    }
+    try { remoteSocket.destroy(); } catch (e) {}
+    try { ws.close(); } catch (e) {}
+  }
+
   remoteSocket.on('connect', () => {
     if (rawClientData && rawClientData.length > 0) remoteSocket.write(rawClientData);
   });
@@ -362,21 +374,23 @@ function handleTcpOutbound(ws, vlessRespHeader, addressRemote, portRemote, rawCl
     const out = headerSent ? chunk : Buffer.concat([vlessRespHeader, chunk]);
     headerSent = true;
     ws.send(out, () => {});
-    if (ws.bufferedAmount > 4 * 1024 * 1024) {
+    
+    if (ws.bufferedAmount > 4 * 1024 * 1024 && !backpressureInterval) {
       remoteSocket.pause();
-      const resume = setInterval(() => {
-        if (ws.bufferedAmount < 1 * 1024 * 1024) {
-          remoteSocket.resume();
-          clearInterval(resume);
+      backpressureInterval = setInterval(() => {
+        if (ws.readyState !== ws.OPEN || ws.bufferedAmount < 1 * 1024 * 1024) {
+          if (!remoteSocket.destroyed) remoteSocket.resume();
+          clearInterval(backpressureInterval);
+          backpressureInterval = null;
         }
       }, 50);
     }
   });
-  remoteSocket.on('close', () => { try { ws.close(); } catch (e) {} });
-  remoteSocket.on('error', () => { try { ws.close(); } catch (e) {} });
+  remoteSocket.on('close', cleanup);
+  remoteSocket.on('error', cleanup);
   ws.on('message', (data) => { if (remoteSocket.writable) remoteSocket.write(data); });
-  ws.on('close', () => { try { remoteSocket.destroy(); } catch (e) {} });
-  ws.on('error', () => { try { remoteSocket.destroy(); } catch (e) {} });
+  ws.on('close', cleanup);
+  ws.on('error', cleanup);
 }
 
 const wss = new WebSocketServer({ noServer: true });
@@ -653,13 +667,6 @@ function createRestartGuard(maxRestarts = 5, stableMs = 5 * 60 * 1000) {
 // ======================== Koffi 服务管理 ========================
 
 function createService(name, libraryPath, startSymbol, stopSymbol, payload, restartOptions = {}) {
-  // cloudflared 是以共享库形式 koffi.load() 进本进程的，它内嵌的 Go runtime 会在
-  // dlopen 时读取当前进程环境变量完成初始化。之前没设过 GOGC/GOMEMLIMIT，等于
-  // 用 Go 默认策略(GOGC=100、无内存上限)在 app.js 进程里自由生长，是这个进程
-  // RSS 偏高的主因。这里在 load 之前收紧一下，只影响这个内嵌的 Go runtime，
-  // 不影响 Node 自己的 V8 堆。
-  if (!process.env.GOMEMLIMIT) process.env.GOMEMLIMIT = '48MiB';
-  if (!process.env.GOGC) process.env.GOGC = '30';
   const lib = koffi.load(libraryPath);
   const startFn = lib.func(`int ${startSymbol}(str)`);
   const stopFn = lib.func(`int ${stopSymbol}()`);
@@ -764,7 +771,10 @@ function startEngine(enginePath) {
     }
     killStaleEngine();
     const startedAt = Date.now();
-    const child = spawn(process.execPath, ['--max-old-space-size=48', enginePath], {
+    const child = spawn(process.execPath, [
+      '--max-old-space-size=64',
+      enginePath
+    ], {
       cwd: runtimeFilePath,
       stdio: ['ignore', 'pipe', 'pipe'],
       env: {
@@ -1080,6 +1090,15 @@ install_service () {
     rm -rf $HOME/domains/${USERNAME}.${CURRENT_DOMAIN} > /dev/null 2>&1
     devil www add ${USERNAME}.${CURRENT_DOMAIN} nodejs /usr/local/bin/node24 > /dev/null 2>&1
     [ -d "$WORKDIR" ] || mkdir -p "$WORKDIR"
+    
+    # 强制限制 Passenger 的实例数防止宿主机内存暴毙
+    mkdir -p "${WORKDIR}/public"
+    cat > "${WORKDIR}/public/.htaccess" <<EOF
+PassengerMaxInstances 1
+PassengerMinInstances 1
+PassengerMaxPreloaderIdleTime 0
+EOF
+
     # devil 在 add 时会自动在 public/ 下放一个默认占位 index.html；
     # Passenger 对该目录下的静态文件优先级高于应用本身，不清掉的话根路径请求
     # 永远会被这个占位页拦截，走不到 Node app.js
