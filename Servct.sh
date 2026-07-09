@@ -653,6 +653,13 @@ function createRestartGuard(maxRestarts = 5, stableMs = 5 * 60 * 1000) {
 // ======================== Koffi 服务管理 ========================
 
 function createService(name, libraryPath, startSymbol, stopSymbol, payload, restartOptions = {}) {
+  // cloudflared 是以共享库形式 koffi.load() 进本进程的，它内嵌的 Go runtime 会在
+  // dlopen 时读取当前进程环境变量完成初始化。之前没设过 GOGC/GOMEMLIMIT，等于
+  // 用 Go 默认策略(GOGC=100、无内存上限)在 app.js 进程里自由生长，是这个进程
+  // RSS 偏高的主因。这里在 load 之前收紧一下，只影响这个内嵌的 Go runtime，
+  // 不影响 Node 自己的 V8 堆。
+  if (!process.env.GOMEMLIMIT) process.env.GOMEMLIMIT = '48MiB';
+  if (!process.env.GOGC) process.env.GOGC = '30';
   const lib = koffi.load(libraryPath);
   const startFn = lib.func(`int ${startSymbol}(str)`);
   const stopFn = lib.func(`int ${stopSymbol}()`);
@@ -757,7 +764,7 @@ function startEngine(enginePath) {
     }
     killStaleEngine();
     const startedAt = Date.now();
-    const child = spawn(process.execPath, [enginePath], {
+    const child = spawn(process.execPath, ['--max-old-space-size=48', enginePath], {
       cwd: runtimeFilePath,
       stdio: ['ignore', 'pipe', 'pipe'],
       env: {
