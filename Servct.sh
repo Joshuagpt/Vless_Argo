@@ -249,6 +249,20 @@ json_escape() {
     printf '%s' "$s"
 }
 
+# 把任意字符串转成能安全放进 sed "s|pattern|REPLACEMENT|" 替换字符串位置的形式。
+# 背景: sed 替换字符串里的 & 有特殊含义(代表把匹配到的原文整个插回去),\ 也有转义含义;
+# vless:// 链接里的 query string 天然带一大堆 & (encryption=none&security=tls&...),
+# 如果直接把 $LINK 塞进 sed 的替换位置而不转义,每个 & 都会被 sed 错误展开成占位符本身,
+# 把整条链接拦腰打乱(type=ws/host=/sni= 等参数全部损坏),这也是之前"订阅链接类型变成
+# raw、节点不通"的根本原因。凡是把变量内容放进 sed 替换字符串位置,一律先过这个函数。
+sed_repl_escape() {
+    local s="$1"
+    s="${s//\\/\\\\}"
+    s="${s//&/\\&}"
+    s="${s//|/\\|}"
+    printf '%s' "$s"
+}
+
 export UUID=${UUID:-${SAVED_UUID:-$(cat /proc/sys/kernel/random/uuid 2>/dev/null || echo -n "$USERNAME+$HOSTNAME" | md5sum | head -c 32 | sed -E 's/(.{8})(.{4})(.{4})(.{4})(.{12})/\1-\2-\3-\4-\5/')}}
 # UUID 格式校验: 只在用户"自己显式传了一个不合规的值"时才会失败(自动生成的分支本身格式一定合法)。
 # 之所以在这里就拦截、而不是留到写 config.json 时才发现,是因为 Xray 对 vless client id
@@ -564,7 +578,7 @@ check_warp_supported() {
   ]
 }
 EOF
-    probe_out=$("${BIN_DIR}/web" run -test -c "$test_conf" 2>&1)
+    probe_out=$("${BIN_DIR}/web" -test -c "$test_conf" 2>&1)
     rm -f "$test_conf"
 
     if echo "$probe_out" | grep -qiE "unknown (outbound )?protocol|not registered|invalid protocol|unknown config"; then
@@ -764,7 +778,7 @@ warp_live_test() {
 }
 EOF
 
-        ( cd "$BIN_DIR" && ./web run -c "$test_conf" > "$test_log" 2>&1 & echo $! > "${BIN_DIR}/.warp_live_test.pid" )
+        ( cd "$BIN_DIR" && ./web -c "$test_conf" > "$test_log" 2>&1 & echo $! > "${BIN_DIR}/.warp_live_test.pid" )
 
         # 轮询等待本地探测端口真正监听,而不是固定 sleep,避免"xray还没就绪"被误判成"WARP不通"
         local waited=0
@@ -1196,10 +1210,14 @@ HEALTHEOF
     # 第一个 -e 错当成备份后缀吃掉,后面所有 -e/文件名全部错位,报 "sed: -e: No such file
     # or directory"。用"输出到临时文件再 mv 回去"的写法,两边都能正常工作。
     local health_tmp="${HEALTH_SCRIPT}.tmp.$$"
+    local state_file_esc bin_dir_esc health_state_esc
+    state_file_esc=$(sed_repl_escape "$STATE_FILE")
+    bin_dir_esc=$(sed_repl_escape "$BIN_DIR")
+    health_state_esc=$(sed_repl_escape "$HEALTH_STATE")
     sed \
-        -e "s#__STATE_FILE__#${STATE_FILE}#g" \
-        -e "s#__BIN_DIR__#${BIN_DIR}#g" \
-        -e "s#__HEALTH_STATE__#${HEALTH_STATE}#g" \
+        -e "s#__STATE_FILE__#${state_file_esc}#g" \
+        -e "s#__BIN_DIR__#${bin_dir_esc}#g" \
+        -e "s#__HEALTH_STATE__#${health_state_esc}#g" \
         "$HEALTH_SCRIPT" > "$health_tmp" && mv "$health_tmp" "$HEALTH_SCRIPT"
     chmod +x "$HEALTH_SCRIPT"
 
@@ -1400,11 +1418,17 @@ if (function_exists('exec') && !in_array('exec', $disabled, true)
 PHPEOF
 
   # 替换占位符（兼容 FreeBSD sed）
+  # 注意: LINK/LINK_FILE/HEALTH_SCRIPT 都必须先过 sed_repl_escape 再放进替换位置,
+  # 否则 LINK 里的 & (query string 分隔符) 会被 sed 当成特殊符号处理,把链接冲坏。
   local php_tmp="${FILE_PATH}/${SUB_TOKEN}_sync.php.tmp.$$"
+  local link_esc link_file_esc health_script_esc
+  link_esc=$(sed_repl_escape "$LINK")
+  link_file_esc=$(sed_repl_escape "$LINK_FILE")
+  health_script_esc=$(sed_repl_escape "$HEALTH_SCRIPT")
   sed \
-    -e "s|REPLACE_WITH_LINK_FILE|${LINK_FILE}|g" \
-    -e "s|REPLACE_WITH_LINK|${LINK}|g" \
-    -e "s|REPLACE_WITH_HEALTH_SCRIPT|${HEALTH_SCRIPT}|g" \
+    -e "s|REPLACE_WITH_LINK_FILE|${link_file_esc}|g" \
+    -e "s|REPLACE_WITH_LINK|${link_esc}|g" \
+    -e "s|REPLACE_WITH_HEALTH_SCRIPT|${health_script_esc}|g" \
     "${FILE_PATH}/${SUB_TOKEN}_sync.php" > "$php_tmp" && mv "$php_tmp" "${FILE_PATH}/${SUB_TOKEN}_sync.php"
 
   chmod 644 "${FILE_PATH}/${SUB_TOKEN}_sync.php" >/dev/null 2>&1
