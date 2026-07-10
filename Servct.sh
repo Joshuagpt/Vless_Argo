@@ -550,16 +550,21 @@ step "下载并校验核心程序(网络耗时最长的一步,请耐心等待)"
 download_binaries
 
 # ---------------------------------------------------------------
-# WARP 出站: 平台能力检测(只做低成本的配置格式预检)
-#   -test 只校验 JSON 语法/字段能否被识别,不代表 wireguard 握手真的能打通——
-#   serv00 的出站 UDP 是否被限制、CF WARP 端点是否可达,这些只有真实发一次流量才知道。
-#   所以这里只当作第一道低成本的快速筛子(能过滤掉"这个二进制根本不认识 wireguard 关键字"
-#   这种情况),真正决定 WARP 是否可用的判断在 warp_live_test() 里。
+# WARP 出站: 平台能力检测
+#   VPS   : 官方 Xray-core v1.8+ 默认内置 wireguard outbound,直接放行
+#   serv00: eooce/test 是第三方重命名的 freebsd 二进制,协议支持情况未知,
+#           不能假设它和官方行为一致,必须用 -test 校验模式实测一份最小 wireguard 配置。
+#           探测本身失败(比如二进制根本不认 -test 这个参数)时,出于稳妥也当作不支持处理,
+#           而不是冒险继续——这是可选增强功能,宁可关掉也不要让它拖垮整个安装。
 # ---------------------------------------------------------------
 check_warp_supported() {
     [ "$WARP" = "1" ] || return 0
 
-    purple "正在检测当前 serv00 二进制是否认识 WARP(wireguard outbound)配置..."
+    if [ "$PLATFORM" = "vps" ]; then
+        return 0
+    fi
+
+    purple "正在检测当前 serv00 二进制是否支持 WARP(wireguard outbound)..."
     local test_conf="${BIN_DIR}/.warp_probe.json" probe_out
     cat > "$test_conf" <<'EOF'
 {
@@ -578,7 +583,7 @@ check_warp_supported() {
   ]
 }
 EOF
-    probe_out=$("${BIN_DIR}/web" -test -c "$test_conf" 2>&1)
+    probe_out=$("${BIN_DIR}/web" run -test -c "$test_conf" 2>&1)
     rm -f "$test_conf"
 
     if echo "$probe_out" | grep -qiE "unknown (outbound )?protocol|not registered|invalid protocol|unknown config"; then
@@ -587,11 +592,11 @@ EOF
         return 1
     fi
     if echo "$probe_out" | grep -qiE "flag provided but not defined|unknown (flag|command)|no such (flag|command)"; then
-        red "当前 serv00 二进制不支持 -test 配置校验模式,无法做后续的真实联通性测试,出于稳妥考虑已自动关闭 WARP"
+        red "当前 serv00 二进制不支持 -test 配置校验模式,无法安全确认 WARP 是否受支持,出于稳妥考虑已自动关闭 WARP"
         export WARP=0
         return 1
     fi
-    green "WARP(wireguard outbound)配置格式预检通过,下一步会用真实密钥做实际联通性测试"
+    green "WARP(wireguard outbound)探测通过"
 }
 
 # ---------------------------------------------------------------
@@ -620,9 +625,14 @@ warp_register() {
     local py_bin=""
     if command -v python3 >/dev/null 2>&1; then
         py_bin="python3"
+    else
+        (apt-get update -y && apt-get install -y python3) >/dev/null 2>&1 \
+            || yum install -y python3 >/dev/null 2>&1 \
+            || apk add --no-cache python3 >/dev/null 2>&1
+        command -v python3 >/dev/null 2>&1 && py_bin="python3"
     fi
     if [ -z "$py_bin" ]; then
-        red "未找到 python3(解析注册结果需要用到),WARP 出站功能已跳过"
+        red "未找到 python3 且自动安装失败(解析注册结果需要用到),WARP 出站功能已跳过"
         export WARP=0; return 1
     fi
 
@@ -697,180 +707,10 @@ PYEOF
     chmod 600 "$WARP_PROFILE" >/dev/null 2>&1
     green "WARP 账号注册成功,凭据已保存到 ${WARP_PROFILE}(以后 re/update 会直接复用,不会重新注册)"
 }
-
-# ---------------------------------------------------------------
-# WARP 出站: 真实联通性测试(用真实注册的密钥,而不是随便编的测试密钥)
-#   这一步是"节点不通"最常见的隐藏根因: check_warp_supported 只验证 JSON 格式合法,
-#   完全不代表 serv00 这台机器出站访问 CF WARP 的 UDP 端点真的能打通——如果打不通,
-#   之前 generate_config() 里的路由规则会把 100% 的流量都硬指给这个"看起来配置正确、
-#   实际收不到任何回包"的 warp-out,表现出来就是:进程都在跑、Argo隧道也连上了,但节点
-#   完全不通,而且没有任何报错日志可看(wireguard握手失败在xray里通常也只是安静地丢包)。
-#
-#   做法: 起一个只有 http inbound + warp outbound 的临时 xray 进程,通过它去请求
-#   Cloudflare 官方的 trace 接口,如果拿到的响应里 warp=on,才能真正证明这条路能通;
-#   全部尝试都拿不到就直接关闭 WARP、回退到直连,保证其余功能不被这一个可选特性拖累。
-#
-#   两个曾导致"必然失败"的问题在这版里一并修掉:
-#   1) 之前固定 sleep 2 秒就去探测,共享主机负载重/启动慢时 xray 还没就绪,
-#      本地代理端口直接连接失败会被误判成"WARP 不通",其实跟 WARP 本身无关。
-#      改成轮询等待本地端口真正监听(最多等 5 秒),再去发起探测请求。
-#   2) 之前只试 WireGuard UDP 2408 一个端口。serv00 这类 FreeBSD jail 环境,
-#      出站 UDP 经常不是"全封",而是只放行部分端口;Cloudflare WARP 官方在多个
-#      UDP 端口上都能握手成功。这里依次尝试一组候选端口(复用同一个注册好的
-#      endpoint 主机,只换端口),任意一个通了就采用那一个,不再"一个端口不通
-#      就判死刑"。
-# ---------------------------------------------------------------
-warp_live_test() {
-    [ "$WARP" = "1" ] || return 0
-    [ -f "$WARP_PROFILE" ] || { export WARP=0; return 1; }
-
-    if ! bash -n "$WARP_PROFILE" 2>/dev/null; then
-        red "WARP 凭据文件语法异常,跳过联通性测试并关闭 WARP"
-        export WARP=0; return 1
-    fi
-    # shellcheck disable=SC1090
-    source "$WARP_PROFILE"
-    if [ -z "$WARP_PRIVATE_KEY" ] || [ -z "$WARP_PEER_PUBLIC_KEY" ]; then
-        red "WARP 凭据缺少必要字段,跳过联通性测试并关闭 WARP"
-        export WARP=0; return 1
-    fi
-
-    # 从注册结果拿到的 endpoint 主机部分(去掉端口),后面轮换端口时复用同一个主机;
-    # 主机名解析失败或格式异常就退回官方域名,避免空主机导致后续全部尝试必然失败。
-    local endpoint_host="${WARP_ENDPOINT%%:*}"
-    [ -z "$endpoint_host" ] && endpoint_host="engage.cloudflareclient.com"
-
-    # Cloudflare WARP 客户端官方支持握手的 UDP 端口不止 2408 一个,
-    # 共享主机的出站 UDP 限制往往只挡了其中一部分,这里依次尝试,
-    # 排在前面的是最常见、最优先应该通的。
-    local candidate_ports=(2408 500 1701 4500 8854 8886)
-
-    purple "正在用真实密钥对 WARP 做联通性实测(会依次尝试 ${#candidate_ports[@]} 个候选端口,每个约需3-5秒)..."
-
-    local port try_port test_conf test_log test_pid trace_out probe_port ok=1 last_reason="" last_log=""
-    test_conf="${BIN_DIR}/.warp_live_test.json"
-    test_log="${BIN_DIR}/.warp_live_test.log"
-
-    for try_port in "${candidate_ports[@]}"; do
-        # 注意: 这里不能像最初那样随机挑一个本地端口来监听探测用的 HTTP inbound。
-        # serv00 的 FreeBSD jail 只放行账号在 devil 里显式登记过的端口(见 check_port()),
-        # 随机端口会被 jail 的包过滤规则直接拒绝 bind(),报 "operation not permitted"——
-        # 这跟 WireGuard/WARP 能不能连通毫无关系,是这个测试自己用错了端口。
-        # $PORT 是 check_port() 早就在 devil 里申请好、明确授权的端口,此时(生产服务还没启动、
-        # 旧进程已经在脚本更早处被杀掉)是空闲的,直接复用它来做探测,保证一定有权限绑定。
-        probe_port="$PORT"
-
-        cat > "$test_conf" <<EOF
-{
-  "log": { "loglevel": "warning" },
-  "inbounds": [
-    { "listen": "127.0.0.1", "port": ${probe_port}, "protocol": "http", "settings": {} }
-  ],
-  "outbounds": [
-    {
-      "protocol": "wireguard",
-      "tag": "warp-out",
-      "settings": {
-        "secretKey": "${WARP_PRIVATE_KEY}",
-        "address": ["${WARP_ADDRESS_V4:-172.16.0.2/32}", "${WARP_ADDRESS_V6:-::/128}"],
-        "peers": [
-          { "publicKey": "${WARP_PEER_PUBLIC_KEY}", "endpoint": "${endpoint_host}:${try_port}" }
-        ],
-        "reserved": [${WARP_RESERVED:-0,0,0}],
-        "mtu": 1280
-      }
-    }
-  ]
-}
-EOF
-
-        : > "$test_log"
-        ( cd "$BIN_DIR" && ./web -c "$test_conf" > "$test_log" 2>&1 & echo $! > "${BIN_DIR}/.warp_live_test.pid" )
-
-        # 轮询等待本地探测端口真正监听,而不是固定 sleep,避免"xray还没就绪"被误判成"WARP不通"
-        local waited=0
-        while [ "$waited" -lt 5 ]; do
-            if command -v timeout >/dev/null 2>&1; then
-                timeout 1 bash -c "echo >/dev/tcp/127.0.0.1/${probe_port}" >/dev/null 2>&1 && break
-            else
-                (exec 3<>"/dev/tcp/127.0.0.1/${probe_port}") >/dev/null 2>&1 && { exec 3>&- 3<&-; break; }
-            fi
-            sleep 0.5
-            waited=$((waited + 1))
-        done
-
-        if [ "$HAVE_CURL" = 1 ]; then
-            trace_out=$(curl -s -m 8 -x "http://127.0.0.1:${probe_port}" "https://www.cloudflare.com/cdn-cgi/trace" 2>/dev/null)
-        else
-            trace_out=$(http_proxy="http://127.0.0.1:${probe_port}" https_proxy="http://127.0.0.1:${probe_port}" wget -qO- -T 8 "https://www.cloudflare.com/cdn-cgi/trace" 2>/dev/null)
-        fi
-
-        local proc_alive=0
-        test_pid=$(cat "${BIN_DIR}/.warp_live_test.pid" 2>/dev/null)
-        [ -n "$test_pid" ] && kill -0 "$test_pid" >/dev/null 2>&1 && proc_alive=1
-        [ -n "$test_pid" ] && kill -9 "$test_pid" >/dev/null 2>&1
-        # probe_port 在几个候选端口之间是复用的(见上面的说明),kill -9 后端口不一定立刻释放,
-        # 这里等它真正空出来再进入下一轮,避免"上一轮进程还没退干净"被误判成"这一轮也失败了"
-        local release_wait=0
-        while [ "$release_wait" -lt 6 ]; do
-            if command -v timeout >/dev/null 2>&1; then
-                timeout 1 bash -c "echo >/dev/tcp/127.0.0.1/${probe_port}" >/dev/null 2>&1 || break
-            else
-                (exec 3<>"/dev/tcp/127.0.0.1/${probe_port}") >/dev/null 2>&1 || break
-            fi
-            sleep 0.3
-            release_wait=$((release_wait + 1))
-        done
-
-        if echo "$trace_out" | grep -q "warp=on"; then
-            green "WARP 联通性测试通过(端口 ${try_port} 握手成功,已确认流量实际经由 WARP 出口,warp=on)"
-            WARP_ENDPOINT="${endpoint_host}:${try_port}"
-            # 把实测能通的端口写回凭据文件,以后 re/update 直接用这个端口,不用每次都重新试全部候选端口。
-            # -i.bak 这种"带附加后缀"的写法 GNU sed / BSD sed(serv00)都认,不用像别处那样再绕道临时文件。
-            sed -i.bak "s|^WARP_ENDPOINT=.*|WARP_ENDPOINT=$(printf '%q' "$WARP_ENDPOINT")|" "$WARP_PROFILE" 2>/dev/null
-            rm -f "${WARP_PROFILE}.bak"
-            ok=0
-            break
-        fi
-
-        # 记下 xray 自己在这次尝试里到底输出了什么(哪怕是空的),留到最后失败时一并打印出来,
-        # 不再单凭"端口有没有开"去猜原因——猜测不能代替 xray 自己的报错。
-        last_log=$(tail -c 2000 "$test_log" 2>/dev/null)
-        if [ "$proc_alive" -eq 0 ] && [ "$waited" -ge 5 ]; then
-            last_reason="进程在探测窗口内已经退出,且本地端口全程未监听(启动阶段就失败了,和 WARP 是否可达无关)"
-        elif [ "$waited" -ge 5 ]; then
-            last_reason="进程还活着,但本地端口一直没监听上(可能是这个版本二进制处理该配置的方式和预期不同)"
-        else
-            last_reason="端口 ${try_port} 本地已监听,但没拿到 warp=on 响应(更像是 WireGuard 握手本身被拦截/超时)"
-        fi
-    done
-
-    rm -f "$test_conf" "$test_log" "${BIN_DIR}/.warp_live_test.pid"
-
-    if [ "$ok" -eq 0 ]; then
-        return 0
-    fi
-
-    red "WARP 联通性测试失败: 已依次尝试 ${candidate_ports[*]} 共 ${#candidate_ports[@]} 个 UDP 端口,全部未能确认 warp=on。"
-    red "最后一次失败原因: ${last_reason}"
-    if [ -n "$last_log" ]; then
-        red "xray 进程最后输出的原始日志(供排查,最多2000字节):"
-        echo "$last_log"
-    else
-        red "xray 进程本次没有任何标准输出/报错(在这个版本二进制上比较反常,值得注意)"
-    fi
-    red "如果每个端口都是同样的失败表现,大概率是 serv00 这台机器的出站 UDP 被平台整体限制(FreeBSD jail 环境常见),不是配置问题;"
-    red "可以登录 SSH 手动执行: nc -u -vz -w3 ${endpoint_host} 2408 (或其它候选端口)做进一步确认。"
-    red "已自动关闭 WARP 并回退为直连出站,确保节点其余功能可用;WARP 凭据已保留,以后该限制解除后可直接复用,无需重新注册。"
-    export WARP=0
-    return 1
-}
-
 if [ "$WARP" = "1" ]; then
-    step "配置 WARP 出站(平台兼容性检测 + 账号凭据 + 真实联通性测试)"
+    step "配置 WARP 出站(平台兼容性检测 + 账号凭据)"
     check_warp_supported
     warp_register
-    warp_live_test
 fi
 
 # ---------------------------------------------------------------
