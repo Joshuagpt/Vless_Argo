@@ -1,7 +1,7 @@
 #!/bin/bash
 # ===================================================================
-# VLESS+WS+Argo 一键部署 —— serv00/ct8 专版（动态数字版）
-# 优化：配置文件 .json、目录伪装、监控解耦、状态后置、无强制退出
+# VLESS+WS+Argo 一键部署 —— serv00/ct8 专版（时序优化版）
+# 修正：save_state 置于 install_healthcheck 之前，避免监控竞争
 # 主页：Project Oceanus 精美设计，传感器数字随机增减（±1~3）
 # ===================================================================
 
@@ -701,11 +701,10 @@ install_homepage() {
     setInterval(() => {
       const el = document.getElementById('buoy-count');
       let val = parseInt(el.innerText.replace(/,/g, ''));
-      // 随机增减 1~3
       let delta = Math.floor(Math.random() * 3) + 1;
       if (Math.random() < 0.5) delta = -delta;
       val += delta;
-      if (val < 0) val = 0; // 避免负数
+      if (val < 0) val = 0;
       el.innerText = val.toLocaleString();
     }, 4000);
   </script>
@@ -756,6 +755,9 @@ PHPEOF
 
 step "生成订阅链接"
 generate_links
+
+# ====== 关键改动：先保存状态，再生成监控脚本 ======
+save_state
 
 install_healthcheck() {
     if [ -z "$TG_TOKEN" ] || [ -z "$TG_ID" ]; then
@@ -958,7 +960,9 @@ EOF
 purple "\n[附加] 配置心跳监控"
 install_healthcheck
 
-save_state
+# 再次保存状态（实际上内容无变化，确保监控脚本生成后状态一致性）
+# 但为了避免监控脚本生成后可能修改状态，我们可再保存一次，但无必要。
+# 这里保留原注释，不再重复保存。
 
 case "$ACTION" in
     re) green "\n重新配置完成!\n" ;;
