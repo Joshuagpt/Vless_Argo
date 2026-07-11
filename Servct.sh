@@ -168,6 +168,7 @@ SAVED_BOT_ARGS=$(printf '%q' "$args")
 SAVED_WORKDIR=$(printf '%q' "$WORKDIR")
 SAVED_FILE_PATH=$(printf '%q' "$FILE_PATH")
 SAVED_WARP=$(printf '%q' "$WARP")
+SAVED_WARP_ACTIVE=$(printf '%q' "${WARP_ACTIVE:-0}")
 EOF
     # STATE_FILE 里明文保存了 TG_TOKEN 等敏感信息,收紧权限避免同机其他用户读取
     chmod 600 "$STATE_FILE" >/dev/null 2>&1
@@ -326,10 +327,12 @@ do_status() {
         echo "TG心跳监控   : 未启用(设置 TG_TOKEN + TG_ID 环境变量后重新执行即可自动开启)"
     fi
     if [ "$SAVED_WARP" = "1" ]; then
-        if [ -f "$WARP_PROFILE" ]; then
-            green "WARP出站     : 已启用(凭据: ${WARP_PROFILE})"
-        else
+        if [ ! -f "$WARP_PROFILE" ]; then
             yellow "WARP出站     : 已请求启用,但尚未找到凭据文件(可能上次注册失败,重新执行脚本会再次尝试注册)"
+        elif [ "$SAVED_WARP_ACTIVE" = "1" ]; then
+            green "WARP出站     : 已启用且当前生效(凭据: ${WARP_PROFILE})"
+        else
+            yellow "WARP出站     : 已启用,但最近一次连通性测试未通过,当前自动回退为直连(巡检脚本每5分钟会重新探测,恢复后自动切回)"
         fi
     else
         echo "WARP出站     : 未启用(每次 install/re/update 时加上 WARP=1 环境变量才会开启,不会沿用上次的状态)"
@@ -700,6 +703,64 @@ PYEOF
     chmod 600 "$WARP_PROFILE" >/dev/null 2>&1
     green "WARP 账号注册成功,凭据已保存到 ${WARP_PROFILE}(以后 re/update 会直接复用,不会重新注册)"
 }
+# ---------------------------------------------------------------
+# WARP 出站: 真实连通性探测(区别于 check_warp_supported 的协议能力探测)
+#   check_warp_supported 只验证二进制"认不认识" wireguard 这个 outbound 类型(-test 语法
+#   校验,不会真的建立连接);账号凭据没问题、协议也支持,不代表 Cloudflare 那端此刻一定可达,
+#   所以这里额外起一个只含 http 入站 + wireguard 出站的临时 xray 实例,实际走一次真实请求,
+#   能拿到正常响应才算真的通。全程放进子 shell 里执行,避免把 WARP_PRIVATE_KEY 等敏感变量
+#   泄漏进外层脚本作用域。
+# ---------------------------------------------------------------
+test_warp_connectivity() {
+    [ -f "$WARP_PROFILE" ] || return 1
+    bash -n "$WARP_PROFILE" 2>/dev/null || return 1
+    (
+        # shellcheck disable=SC1090
+        source "$WARP_PROFILE"
+        [ -n "$WARP_PRIVATE_KEY" ] && [ -n "$WARP_PEER_PUBLIC_KEY" ] || exit 1
+
+        probe_port=$(( (RANDOM % 20000) + 20000 ))
+        probe_conf="${BIN_DIR}/.warp_probe.json"
+        cat > "$probe_conf" <<PEOF
+{
+  "log": { "loglevel": "none" },
+  "inbounds": [
+    { "tag": "probe-in", "listen": "127.0.0.1", "port": ${probe_port}, "protocol": "http" }
+  ],
+  "outbounds": [
+    {
+      "protocol": "wireguard",
+      "tag": "warp-probe",
+      "settings": {
+        "secretKey": "${WARP_PRIVATE_KEY}",
+        "address": ["${WARP_ADDRESS_V4:-172.16.0.2/32}", "${WARP_ADDRESS_V6:-::/128}"],
+        "peers": [
+            { "publicKey": "${WARP_PEER_PUBLIC_KEY}", "endpoint": "${WARP_ENDPOINT:-engage.cloudflareclient.com:2408}" }
+        ],
+        "reserved": [${WARP_RESERVED:-0,0,0}],
+        "mtu": 1280
+      }
+    }
+  ]
+}
+PEOF
+        "${BIN_DIR}/web" -c "$probe_conf" >/dev/null 2>&1 &
+        probe_pid=$!
+        sleep 1.5
+        ok=1
+        if kill -0 "$probe_pid" >/dev/null 2>&1; then
+            if [ "$HAVE_CURL" = 1 ]; then
+                curl -fsS --max-time 5 -x "http://127.0.0.1:${probe_port}" -o /dev/null "http://cp.cloudflare.com/generate_204" >/dev/null 2>&1 && ok=0
+            else
+                http_proxy="http://127.0.0.1:${probe_port}" wget -q -T 5 -O /dev/null "http://cp.cloudflare.com/generate_204" >/dev/null 2>&1 && ok=0
+            fi
+        fi
+        kill -9 "$probe_pid" >/dev/null 2>&1
+        wait "$probe_pid" 2>/dev/null
+        rm -f "$probe_conf"
+        exit $ok
+    )
+}
 if [ "$WARP" = "1" ]; then
     step "配置 WARP 出站(平台兼容性检测 + 账号凭据)"
     check_warp_supported
@@ -708,53 +769,15 @@ fi
 
 # ---------------------------------------------------------------
 # 生成 Xray 配置(协议 vless+ws)
+#   同时生成两份: config-direct.json(纯直连,兜底) 和 config-warp.json(WARP 出站,
+#   仅当凭据有效时才生成)。真正启动用哪一份由 select_active_config() 按实时连通性测试结果
+#   决定,巡检脚本此后每轮也会重新测试并按需切换,不需要重新执行本脚本。
 # ---------------------------------------------------------------
-generate_config() {
+_render_xray_config() {
+  local out_file="$1" warp_outbound="$2" warp_routing="$3" uuid_json
   # UUID 已经在前面做过格式校验,这里再套一层 json_escape 纯粹是双保险,不依赖单一防线
-  local uuid_json
   uuid_json=$(json_escape "$UUID")
-
-  # WARP=1 且凭据文件存在有效时,才真正拼接 wireguard 出站;
-  # 任何一个条件不满足都安静地退回纯直连(freedom),不生成半残的 WARP 配置
-  local warp_outbound="" warp_routing=""
-  if [ "$WARP" = "1" ] && [ -f "$WARP_PROFILE" ]; then
-    # source 之前先做一次纯语法检查(不会执行文件内容),避免文件损坏/被篡改时
-    # source 中途出错导致变量只被部分赋值、还继续带着这个半残状态往下跑。
-    # 检查不通过就把这份坏文件隔离改名,下次 warp_register() 会把它当成"没有凭据"
-    # 重新走一遍注册流程,相当于自动恢复,不需要用户手动介入。
-    if bash -n "$WARP_PROFILE" 2>/dev/null; then
-        # shellcheck disable=SC1090
-        source "$WARP_PROFILE"
-    else
-        red "WARP 凭据文件语法异常(可能被篡改或损坏),本次跳过 WARP 出站;已将坏文件隔离,下次 re/update 会自动重新注册"
-        mv -f "$WARP_PROFILE" "${WARP_PROFILE}.corrupt.$(date +%s)" 2>/dev/null
-    fi
-    if [ -n "$WARP_PRIVATE_KEY" ] && [ -n "$WARP_PEER_PUBLIC_KEY" ]; then
-        warp_outbound=",
-        {
-            \"protocol\": \"wireguard\",
-            \"tag\": \"warp-out\",
-            \"settings\": {
-                \"secretKey\": \"${WARP_PRIVATE_KEY}\",
-                \"address\": [\"${WARP_ADDRESS_V4:-172.16.0.2/32}\", \"${WARP_ADDRESS_V6:-::/128}\"],
-                \"peers\": [
-                    { \"publicKey\": \"${WARP_PEER_PUBLIC_KEY}\", \"endpoint\": \"${WARP_ENDPOINT:-engage.cloudflareclient.com:2408}\" }
-                ],
-                \"reserved\": [${WARP_RESERVED:-0,0,0}],
-                \"mtu\": 1280
-            }
-        }"
-        # 所有非本地流量都走 warp-out;direct 仍保留,供以后需要按域名/IP 分流时使用
-        warp_routing=",
-    \"routing\": {
-        \"rules\": [
-            { \"type\": \"field\", \"outboundTag\": \"warp-out\", \"network\": \"tcp,udp\" }
-        ]
-    }"
-    fi
-  fi
-
-  cat > "${BIN_DIR}/config.json" << EOF
+  cat > "$out_file" << EOF
 {
     "log": {
         "access": "/dev/null",
@@ -793,8 +816,82 @@ generate_config() {
 }
 EOF
 }
+
+generate_config() {
+  # WARP=1 且凭据文件存在有效时,才拼接 wireguard 出站段落;
+  # 任何一个条件不满足都只生成纯直连版本,不生成半残的 WARP 配置
+  local warp_outbound="" warp_routing=""
+  if [ "$WARP" = "1" ] && [ -f "$WARP_PROFILE" ]; then
+    # source 之前先做一次纯语法检查(不会执行文件内容),避免文件损坏/被篡改时
+    # source 中途出错导致变量只被部分赋值、还继续带着这个半残状态往下跑。
+    # 检查不通过就把这份坏文件隔离改名,下次 warp_register() 会把它当成"没有凭据"
+    # 重新走一遍注册流程,相当于自动恢复,不需要用户手动介入。
+    if bash -n "$WARP_PROFILE" 2>/dev/null; then
+        # shellcheck disable=SC1090
+        source "$WARP_PROFILE"
+    else
+        red "WARP 凭据文件语法异常(可能被篡改或损坏),本次跳过 WARP 出站;已将坏文件隔离,下次 re/update 会自动重新注册"
+        mv -f "$WARP_PROFILE" "${WARP_PROFILE}.corrupt.$(date +%s)" 2>/dev/null
+    fi
+    if [ -n "$WARP_PRIVATE_KEY" ] && [ -n "$WARP_PEER_PUBLIC_KEY" ]; then
+        warp_outbound=",
+        {
+            \"protocol\": \"wireguard\",
+            \"tag\": \"warp-out\",
+            \"settings\": {
+                \"secretKey\": \"${WARP_PRIVATE_KEY}\",
+                \"address\": [\"${WARP_ADDRESS_V4:-172.16.0.2/32}\", \"${WARP_ADDRESS_V6:-::/128}\"],
+                \"peers\": [
+                    { \"publicKey\": \"${WARP_PEER_PUBLIC_KEY}\", \"endpoint\": \"${WARP_ENDPOINT:-engage.cloudflareclient.com:2408}\" }
+                ],
+                \"reserved\": [${WARP_RESERVED:-0,0,0}],
+                \"mtu\": 1280
+            }
+        }"
+        # 所有非本地流量都走 warp-out;direct 仍保留,供直连版本以及以后按域名/IP 分流时使用
+        warp_routing=",
+    \"routing\": {
+        \"rules\": [
+            { \"type\": \"field\", \"outboundTag\": \"warp-out\", \"network\": \"tcp,udp\" }
+        ]
+    }"
+    fi
+  fi
+
+  _render_xray_config "${BIN_DIR}/config-direct.json" "" ""
+  if [ -n "$warp_outbound" ]; then
+      _render_xray_config "${BIN_DIR}/config-warp.json" "$warp_outbound" "$warp_routing"
+  else
+      # 上次装的时候可能生成过 WARP 版本,这次凭据没了就清掉,避免残留旧版本被巡检脚本误用
+      rm -f "${BIN_DIR}/config-warp.json"
+  fi
+}
 step "生成节点配置"
 generate_config
+
+# ---------------------------------------------------------------
+# 选择本次实际生效的出站: WARP 连通性测试通过就用 WARP,不通过(或用户没开)就用直连,
+# 结果记录进 WARP_ACTIVE 供 save_state 持久化;巡检脚本(monitor.sh)按同样逻辑持续复测,
+# 连通性恢复/异常时自动切换,不需要重新执行本脚本。
+# ---------------------------------------------------------------
+WARP_ACTIVE=0
+select_active_config() {
+    if [ "$WARP" = "1" ] && [ -f "${BIN_DIR}/config-warp.json" ]; then
+        purple "正在测试 WARP 出站连通性..."
+        if test_warp_connectivity; then
+            green "WARP 连通性测试通过,本次使用 WARP 出站"
+            WARP_ACTIVE=1
+        else
+            yellow "WARP 连通性测试未通过,本次自动回退为直连出站(巡检脚本每5分钟会重新探测,恢复后自动切回 WARP,无需手动操作)"
+        fi
+    fi
+    if [ "$WARP_ACTIVE" = "1" ]; then
+        cp -f "${BIN_DIR}/config-warp.json" "${BIN_DIR}/config.json"
+    else
+        cp -f "${BIN_DIR}/config-direct.json" "${BIN_DIR}/config.json"
+    fi
+}
+select_active_config
 
 # ---------------------------------------------------------------
 # 启动服务(serv00 无 systemd 权限,用 nohup 后台进程 + cron 巡检保活)
@@ -980,6 +1077,62 @@ restart_cf() {
     is_alive_cf
 }
 
+WARP_PROFILE="${BIN_DIR}/.wg.env"
+
+# WARP 真实连通性探测,原理同主脚本的 test_warp_connectivity():起一个只含 http 入站 +
+# wireguard 出站的临时 xray 实例,实际发一次请求,而不只是看凭据文件在不在。
+# 子 shell 隔离,避免把 WARP_PRIVATE_KEY 等敏感变量泄漏进这个长期存在于磁盘上的巡检脚本的主作用域。
+probe_warp() {
+    [ -f "$WARP_PROFILE" ] || return 1
+    bash -n "$WARP_PROFILE" 2>/dev/null || return 1
+    (
+        # shellcheck disable=SC1090
+        source "$WARP_PROFILE"
+        [ -n "$WARP_PRIVATE_KEY" ] && [ -n "$WARP_PEER_PUBLIC_KEY" ] || exit 1
+
+        probe_port=$(( (RANDOM % 20000) + 20000 ))
+        probe_conf="${BIN_DIR}/.warp_probe.json"
+        cat > "$probe_conf" <<PEOF
+{
+  "log": { "loglevel": "none" },
+  "inbounds": [
+    { "tag": "probe-in", "listen": "127.0.0.1", "port": ${probe_port}, "protocol": "http" }
+  ],
+  "outbounds": [
+    {
+      "protocol": "wireguard",
+      "tag": "warp-probe",
+      "settings": {
+        "secretKey": "${WARP_PRIVATE_KEY}",
+        "address": ["${WARP_ADDRESS_V4:-172.16.0.2/32}", "${WARP_ADDRESS_V6:-::/128}"],
+        "peers": [
+            { "publicKey": "${WARP_PEER_PUBLIC_KEY}", "endpoint": "${WARP_ENDPOINT:-engage.cloudflareclient.com:2408}" }
+        ],
+        "reserved": [${WARP_RESERVED:-0,0,0}],
+        "mtu": 1280
+      }
+    }
+  ]
+}
+PEOF
+        "${BIN_DIR}/web" -c "$probe_conf" >/dev/null 2>&1 &
+        pp=$!
+        sleep 1.5
+        ok=1
+        if kill -0 "$pp" >/dev/null 2>&1; then
+            if command -v curl >/dev/null 2>&1; then
+                curl -fsS --max-time 5 -x "http://127.0.0.1:${probe_port}" -o /dev/null "http://cp.cloudflare.com/generate_204" >/dev/null 2>&1 && ok=0
+            elif command -v wget >/dev/null 2>&1; then
+                http_proxy="http://127.0.0.1:${probe_port}" wget -q -T 5 -O /dev/null "http://cp.cloudflare.com/generate_204" >/dev/null 2>&1 && ok=0
+            fi
+        fi
+        kill -9 "$pp" >/dev/null 2>&1
+        wait "$pp" 2>/dev/null
+        rm -f "$probe_conf"
+        exit $ok
+    )
+}
+
 # 取当前生效的 Argo 域名。
 # 固定隧道(设置了 ARGO_AUTH,token 或 TunnelSecret 模式)域名是绑定好的,不会变,直接返回。
 # quick tunnel(未设置 ARGO_AUTH)模式下,每次 cloudflared 重启域名都会重新随机分配,需要从 boot.log 里解析;
@@ -1001,16 +1154,46 @@ get_current_domain() {
 }
 
 # 读取上一次记录的状态,文件不存在(首次运行)时视为"up"且域名未知,避免刚装好第一次检测就误报
-prev_xray="up"; prev_cf="up"; prev_domain=""
+prev_xray="up"; prev_cf="up"; prev_domain=""; prev_warp_active="0"
 if [ -f "$HEALTH_STATE_FILE" ]; then
     # shellcheck disable=SC1090
     source "$HEALTH_STATE_FILE"
 fi
 
+msg=""
+
+# WARP 出站健康检查与自动切换: 仅当用户开启了 WARP 且直连/WARP 两套配置都存在时才生效。
+# 每轮巡检都重新测一次真实连通性,只有状态发生变化(通→断 或 断→通)时才切配置 + 重启 xray,
+# 不是每轮都重启,避免节点无谓抖动。切换发生在下面的存活检测之前,这样紧接着的
+# is_alive_xray 检测到的就已经是切换后的最新状态,不会跟下面的掉线重启逻辑重复动作。
+cur_warp_active="$prev_warp_active"
+if [ "$SAVED_WARP" = "1" ] && [ -f "${BIN_DIR}/config-warp.json" ] && [ -f "${BIN_DIR}/config-direct.json" ]; then
+    if probe_warp; then
+        cur_warp_active="1"
+    else
+        cur_warp_active="0"
+    fi
+    if [ "$cur_warp_active" != "$prev_warp_active" ]; then
+        if [ "$cur_warp_active" = "1" ]; then
+            cp -f "${BIN_DIR}/config-warp.json" "${BIN_DIR}/config.json"
+        else
+            cp -f "${BIN_DIR}/config-direct.json" "${BIN_DIR}/config.json"
+        fi
+        if restart_xray; then
+            if [ "$cur_warp_active" = "1" ]; then
+                msg="${msg}🟢 WARP 出站连通性恢复,已自动切换为 WARP 出站 ✅"$'\n'
+            else
+                msg="${msg}🟡 WARP 出站连通性异常,已自动回退为直连出站 ⚠️"$'\n'
+            fi
+        else
+            msg="${msg}🔴 切换出站(WARP↔直连)后 xray 重启失败,请人工检查 ❌"$'\n'
+        fi
+    fi
+fi
+
 cur_xray="down"; is_alive_xray && cur_xray="up"
 cur_cf="down"; is_alive_cf && cur_cf="up"
 cf_restarted=0
-msg=""
 
 if [ "$cur_xray" = "down" ] && [ "$prev_xray" != "down" ]; then
     if restart_xray; then
@@ -1063,6 +1246,7 @@ cat > "$HEALTH_STATE_FILE" <<EOF2
 prev_xray=${cur_xray}
 prev_cf=${cur_cf}
 prev_domain=${cur_domain}
+prev_warp_active=${cur_warp_active}
 EOF2
 HEALTHEOF
 
@@ -1082,10 +1266,13 @@ HEALTHEOF
         "$HEALTH_SCRIPT" > "$health_tmp" && mv "$health_tmp" "$HEALTH_SCRIPT"
     chmod +x "$HEALTH_SCRIPT"
 
-    # 首次安装/每次重装都重置为"正常",避免用旧状态触发一次多余的通知
+    # 首次安装/每次重装都重置为"正常",避免用旧状态触发一次多余的通知;
+    # prev_warp_active 用本次 select_active_config() 的结果,而不是硬编码,
+    # 否则装完之后第一次巡检会把"当前状态"误判成"刚刚发生的切换"而多发一条通知
     cat > "$HEALTH_STATE" <<EOF
 prev_xray=up
 prev_cf=up
+prev_warp_active=${WARP_ACTIVE:-0}
 EOF
 
     remove_healthcheck_schedule   # 先清一遍旧的,防止 re/update 反复执行时重复叠加
