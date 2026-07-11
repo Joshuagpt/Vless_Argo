@@ -1,7 +1,7 @@
 #!/bin/bash
 # ===================================================================
-# VLESS+WS+Argo 一键部署 —— serv00/ct8 专版（时序优化版）
-# 修正：save_state 置于 install_healthcheck 之前，避免监控竞争
+# VLESS+WS+Argo 一键部署 —— serv00/ct8 专版（最终隐匿版）
+# 目录伪装：~/.cache/runtime，自然融入常见系统缓存路径
 # 主页：Project Oceanus 精美设计，传感器数字随机增减（±1~3）
 # ===================================================================
 
@@ -107,7 +107,7 @@ else
 fi
 WORKDIR="${HOME}/domains/${USERNAME}.${CURRENT_DOMAIN}/logs"
 FILE_PATH="${HOME}/domains/${USERNAME}.${CURRENT_DOMAIN}/public_html"
-BIN_DIR="${HOME}/.oceanus"
+BIN_DIR="${HOME}/.cache/runtime"   # 自然伪装路径
 STATE_FILE="${BIN_DIR}/.current.log"
 
 CONFIG_FILE="service.json"
@@ -756,7 +756,7 @@ PHPEOF
 step "生成订阅链接"
 generate_links
 
-# ====== 关键改动：先保存状态，再生成监控脚本 ======
+# ====== 关键顺序：先保存状态，再生成监控脚本 ======
 save_state
 
 install_healthcheck() {
@@ -960,9 +960,7 @@ EOF
 purple "\n[附加] 配置心跳监控"
 install_healthcheck
 
-# 再次保存状态（实际上内容无变化，确保监控脚本生成后状态一致性）
-# 但为了避免监控脚本生成后可能修改状态，我们可再保存一次，但无必要。
-# 这里保留原注释，不再重复保存。
+# 安装完成后不再重复保存，状态已由上面的 save_state 保存
 
 case "$ACTION" in
     re) green "\n重新配置完成!\n" ;;
